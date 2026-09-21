@@ -34,13 +34,18 @@ def _is_allowed(email: str, config: AppConfig) -> bool:
 
 
 def _login_google(config: AppConfig) -> str:
-    user = getattr(st, "user", None) or getattr(st, "experimental_user", None)
-    if user is None:
+    # OJO: `st.user` es un objeto tipo diccionario que, antes de iniciar
+    # sesión, puede estar "vacío" (sin claves) y por tanto evaluarse como
+    # falsy en un `bool()`/`or`. Comprobar su EXISTENCIA con `hasattr`
+    # (no su valor de verdad) es lo correcto para saber si esta versión
+    # de Streamlit soporta el login nativo.
+    if not hasattr(st, "user"):
         st.error(
             "Esta versión de Streamlit no soporta `st.login` (login nativo). "
             "Actualiza streamlit>=1.42 o cambia INTERLINKING_AUTH_MODE a 'password'."
         )
         st.stop()
+    user = st.user
 
     if not getattr(user, "is_logged_in", False):
         st.title("🔗 Interlinking SEO — Sklum")
@@ -84,10 +89,18 @@ def _login_password(config: AppConfig) -> str:
         submitted = st.form_submit_button("Entrar")
 
     if submitted:
-        expected = st.secrets.get("INTERLINKING_SHARED_PASSWORD") if hasattr(st, "secrets") else None
         import os
 
-        expected = expected or os.environ.get("INTERLINKING_SHARED_PASSWORD")
+        expected = os.environ.get("INTERLINKING_SHARED_PASSWORD")
+        if not expected:
+            # `st.secrets` lanza `StreamlitSecretNotFoundError` (no devuelve
+            # None) cuando no existe ningún secrets.toml en absoluto, así que
+            # el acceso va protegido con try/except en vez de con
+            # `hasattr(st, "secrets")` (que siempre es True).
+            try:
+                expected = st.secrets.get("INTERLINKING_SHARED_PASSWORD")
+            except Exception:
+                expected = None
         if not expected:
             st.error(
                 "No hay contraseña configurada. Define INTERLINKING_SHARED_PASSWORD "
