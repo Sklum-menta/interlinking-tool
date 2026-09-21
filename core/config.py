@@ -38,29 +38,55 @@ class ScoringWeights:
     normalizan internamente si no suman 1, así que el usuario puede
     moverlos libremente desde la interfaz sin preocuparse de que sumen
     exactamente 100%).
+
+    `relevancia_categoria` y `prioridad_negocio` son los dos ajustes
+    MANUALES de negocio (ver `core.scoring`): si el equipo no rellena
+    esas tablas desde la interfaz, su valor por defecto es neutro
+    (relevancia=0.5, prioridad=0.0 para todas las URLs) y por tanto no
+    alteran el orden de la propuesta aunque el peso sea > 0.
+
+    `autoridad_origen` y `presupuesto_enlaces_origen` miran a la
+    categoría ORIGEN (no destino): cuánta autoridad interna tiene ya
+    (más enlaces entrantes propios → transmite más valor) y cuánto
+    "presupuesto" de enlaces salientes le queda (si ya enlaza a muchas
+    URLs, cada enlace nuevo diluye más el valor que reparte). Su valor
+    por defecto es 0 (no afectan) hasta que se suban explícitamente.
+
+    `posicion_oportunidad` e `impresiones_busqueda` son opcionales y
+    requieren el dataset de Search Console (ver `core.data_loader`): si
+    no se sube, su valor por defecto también es 0.
     """
 
     volumen_busqueda: float = 0.40
     pocos_productos: float = 0.20
     pocos_enlaces_entrantes: float = 0.20
     afinidad_categoria: float = 0.20
+    relevancia_categoria: float = 0.0
+    prioridad_negocio: float = 0.0
+    autoridad_origen: float = 0.0
+    presupuesto_enlaces_origen: float = 0.0
+    posicion_oportunidad: float = 0.0
+    impresiones_busqueda: float = 0.0
 
     def normalizados(self) -> "ScoringWeights":
-        total = (
-            self.volumen_busqueda
-            + self.pocos_productos
-            + self.pocos_enlaces_entrantes
-            + self.afinidad_categoria
+        campos = (
+            self.volumen_busqueda,
+            self.pocos_productos,
+            self.pocos_enlaces_entrantes,
+            self.afinidad_categoria,
+            self.relevancia_categoria,
+            self.prioridad_negocio,
+            self.autoridad_origen,
+            self.presupuesto_enlaces_origen,
+            self.posicion_oportunidad,
+            self.impresiones_busqueda,
         )
+        total = sum(campos)
         if total <= 0:
             # Evita división por cero si el usuario pone todo a 0.
-            return ScoringWeights(0.25, 0.25, 0.25, 0.25)
-        return ScoringWeights(
-            volumen_busqueda=self.volumen_busqueda / total,
-            pocos_productos=self.pocos_productos / total,
-            pocos_enlaces_entrantes=self.pocos_enlaces_entrantes / total,
-            afinidad_categoria=self.afinidad_categoria / total,
-        )
+            n = 1 / len(campos)
+            return ScoringWeights(*([n] * len(campos)))
+        return ScoringWeights(*(valor / total for valor in campos))
 
 
 @dataclass
@@ -75,6 +101,20 @@ class AffinityScores:
     misma_principal_y_secundaria: float = 1.0
     misma_principal: float = 0.6
     distinta: float = 0.15
+
+
+@dataclass
+class OportunidadSEO:
+    """Rango de posición media de Search Console que se considera "zona
+    de oportunidad" (candidatas a subir a primera página con un empujón
+    de enlaces internos). Dentro del rango, `posicion_oportunidad`
+    (ver `core.scoring.oportunidad_posicion_score`) vale 1.0 (máxima
+    prioridad); fuera de él decae progresivamente.
+    """
+
+    posicion_min: float = 4.0
+    posicion_max: float = 20.0
+    ventana_decaimiento: float = 30.0
 
 
 @dataclass
