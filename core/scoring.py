@@ -7,6 +7,8 @@ tests/test_exclusion.py).
 """
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from core.config import AffinityScores, LimitesPropuesta, OportunidadSEO, ScoringWeights
@@ -578,3 +580,70 @@ def generate_link_proposals(
     )
 
     return resultado[RESULT_COLUMNS].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 5) Formato "ancho" (id + enlaces en columnas) para integraciones externas
+# ---------------------------------------------------------------------------
+
+_ID_SLUG_RE = re.compile(r"(\d+)-")
+
+
+def extraer_id_de_url(url: str | None) -> str:
+    """Extrae el ID numérico del slug de una URL de Sklum, p.ej.
+    'https://www.sklum.com/es/524-comprar-mobiliario' -> '524'. Si la
+    URL no sigue ese patrón (o viene vacía), devuelve "" en vez de
+    lanzar un error, para que una URL atípica no rompa la exportación
+    entera.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    match = _ID_SLUG_RE.match(slug)
+    return match.group(1) if match else ""
+
+
+def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
+    """Convierte la propuesta (una fila por par origen-destino) al
+    formato ancho que ya usaba el equipo con el flujo anterior de
+    Sheets/Apps Script: una fila por URL origen, con su "id" (extraído
+    de la URL) y, a continuación, pares linked_id_N / linked_url_N con
+    cada enlace SELECCIONADO (respeta el máximo y el score mínimo ya
+    aplicados en `generate_link_proposals`), ordenados de mayor a menor
+    score. El número de pares de columnas se ajusta automáticamente al
+    mayor nº de enlaces seleccionados que tenga cualquier origen (no
+    viene fijo a 5): si el límite configurado es distinto, cambia solo.
+    """
+    columnas_vacias = ["id", "url"]
+    if resultado is None or resultado.empty or "seleccionada" not in resultado.columns:
+        return pd.DataFrame(columns=columnas_vacias)
+
+    seleccion = resultado[resultado["seleccionada"]].copy()
+    if seleccion.empty:
+        return pd.DataFrame(columns=columnas_vacias)
+
+    seleccion = seleccion.sort_values(
+        ["categoria_origen", "score"], ascending=[True, False], na_position="last"
+    )
+    # OJO: pandas no permite que un campo de itertuples empiece por "_"
+    # (lo renombra a algo posicional tipo "_1"), así que aquí la columna
+    # de orden va sin guion bajo — a diferencia de la "_orden" que usa
+    # generate_link_proposals más arriba, que se consume con .loc/boolean
+    # indexing, no con itertuples.
+    seleccion["orden"] = seleccion.groupby("categoria_origen").cumcount() + 1
+    max_enlaces = int(seleccion["orden"].max())
+
+    filas = []
+    for origen, grupo in seleccion.groupby("categoria_origen", sort=False):
+        fila = {"id": extraer_id_de_url(origen), "url": origen}
+        for row in grupo.itertuples(index=False):
+            n = int(row.orden)
+            fila[f"linked_id_{n}"] = extraer_id_de_url(row.categoria_destino)
+            fila[f"linked_url_{n}"] = row.categoria_destino
+        filas.append(fila)
+
+    columnas = list(columnas_vacias)
+    for n in range(1, max_enlaces + 1):
+        columnas += [f"linked_id_{n}", f"linked_url_{n}"]
+
+    return pd.DataFrame(filas).reindex(columns=columnas)
