@@ -208,6 +208,7 @@ vacía lista para rellenar en `sample_data/plantilla_unificada.xlsx`
 | `Volumen` | Volumen de búsqueda mensual de `Keyword_1` |
 | `Enlace_Bolita_1`, `Enlace_Bolita_2`, ... | URL completa de cada enlace existente del widget de categorías relacionadas ("bolitas"). Deja vacías las que no apliquen; añade más columnas numeradas si hacen falta más de las que trae la plantilla — no hay ningún límite, y no pasa nada si unas filas usan más columnas que otras. |
 | `Enlace_Breadcrumb_1`, `Enlace_Breadcrumb_2`, ... | Igual que las bolitas, para los enlaces del breadcrumb. |
+| `Enlace_Texto_1`, `Enlace_Texto_2`, ... | Enlaces ya metidos a mano dentro del texto/contenido de la categoria. A diferencia de bolitas/breadcrumb, **admite ruta relativa sin dominio** (p.ej. `/es/4057-comprar-aparadores`): la herramienta la resuelve automaticamente contra el dominio de la `URL` de esa misma fila. Tambien acepta la URL completa si la teneis asi. |
 
 Internamente la herramienta usa exactamente el mismo reconocimiento de
 columnas que los 4 ficheros separados (`load_plantilla_unificada` en
