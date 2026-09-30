@@ -1,0 +1,23 @@
+# Blueprint de despliegue en Render (alternativa a Streamlit Community
+# Cloud, que se ha quedado corto de RAM con el catálogo real de Sklum).
+#
+# Cómo usarlo:
+#   1. En https://dashboard.render.com → "New" → "Blueprint".
+#   2. Conecta el repositorio de GitHub "Sklum-menta/interlinking-tool".
+#   3. Render detecta este fichero y propone crear el servicio de abajo.
+#   4. IMPORTANTE: elige un "Instance Type" con al menos 2 GB de RAM
+#      (el plan gratuito de Render, como el de Streamlit, se queda
+#      corto para el catálogo completo). Standard (2 GB) o superior.
+#   5. Antes de desplegar, añade el fichero secreto (ver RENDER_DEPLOY.md
+#      en este mismo repo) con el contenido de tu secrets.toml.
+services:
+  - type: web
+    name: interlinking-tool
+    runtime: python
+    plan: standard
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
