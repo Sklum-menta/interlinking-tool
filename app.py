@@ -584,6 +584,7 @@ if generar:
             if sc_actual_file is not None:
                 search_console_actual = load_search_console(sc_actual_file)
 
+            contador_generacion: dict = {}
             with st.spinner("Calculando scores y generando propuesta..."):
                 resultado = generate_link_proposals(
                     datasets,
@@ -595,12 +596,15 @@ if generar:
                     grupos_aislados=grupos_aislados,
                     search_console=search_console_actual,
                     oportunidad=oportunidad,
+                    contador=contador_generacion,
                 )
             st.session_state["propuesta"] = resultado
             st.success(f"Propuesta generada: {len(resultado)} filas.")
 
             st.session_state["ultimo_diagnostico"] = None
+            st.session_state["ultimo_embudo"] = None
             if resultado.empty:
+                st.session_state["ultimo_embudo"] = contador_generacion
                 try:
                     st.session_state["ultimo_diagnostico"] = diagnosticar_datasets(
                         datasets,
@@ -771,3 +775,84 @@ elif resultado is not None:
 
         with st.expander("Ver detalle completo del diagnóstico"):
             st.json(diagnostico)
+
+    embudo = st.session_state.get("ultimo_embudo")
+    if embudo:
+        st.subheader("🔻 En qué paso se han perdido los enlaces")
+        st.caption(
+            "Cada número es cuántos pares origen→destino sobrevivían justo "
+            "después de aplicar ese filtro. En cuanto un número baja a 0, ese "
+            "es el filtro que ha vaciado la propuesta."
+        )
+
+        pasos = [
+            ("Pares candidatos (antes de filtrar)", "pares_antes_de_filtros"),
+            ("... tras 'categorías aisladas'", "pares_tras_grupo_aislado"),
+            ("... tras excluir destinos no saludables", "pares_tras_salud_destino"),
+            ("... tras excluir enlaces ya existentes", "pares_tras_excluir_enlaces_existentes"),
+        ]
+        cols = st.columns(len(pasos))
+        for col, (etiqueta, clave) in zip(cols, pasos):
+            col.metric(etiqueta, embudo.get(clave, 0))
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Pares con score calculado", embudo.get("pares_validos_con_score", 0))
+        c2.metric("Pendientes de confirmar", embudo.get("pares_pendientes_confirmar", 0))
+        c3.metric("Seleccionados (score ≥ mínimo)", embudo.get("pares_seleccionados", 0))
+
+        score_max = embudo.get("score_valido_maximo")
+        score_minimo_usado = embudo.get("score_minimo_usado")
+
+        if embudo.get("pares_antes_de_filtros", 0) == 0:
+            st.error(
+                "No se ha generado ni un solo par candidato: el catálogo tiene "
+                "menos de 2 URLs útiles tras la limpieza."
+            )
+        elif embudo.get("pares_tras_grupo_aislado", 0) == 0:
+            st.error(
+                "**Aquí está el bloqueo:** el filtro de 'categorías aisladas' "
+                "(sección 2, Black Friday/Rebajas/Special Price o los patrones "
+                "que tengas configurados ahí) ha descartado TODOS los pares. "
+                "Revisa esa lista de patrones: seguramente coincide con texto "
+                "que aparece en todas (o casi todas) las categorías del "
+                "catálogo real, aislando cada una por su cuenta."
+            )
+        elif embudo.get("pares_tras_salud_destino", 0) == 0:
+            st.error(
+                "**Aquí está el bloqueo:** todas las URLs han quedado marcadas "
+                "como destino 'no saludable' (columnas Status_Code/Indexable "
+                "del fichero). Es muy probable que se esté leyendo una columna "
+                "equivocada como si fuera 'Indexable' o 'Status_Code' — revisa "
+                "esas dos columnas en tu fichero."
+            )
+        elif embudo.get("pares_tras_excluir_enlaces_existentes", 0) == 0:
+            st.error(
+                "**Aquí está el bloqueo:** todos los pares candidatos ya tenían "
+                "un enlace existente entre sí, según el dataset de enlaces "
+                "leído del fichero. Revisa cómo se están interpretando las "
+                "columnas de enlaces existentes (bolitas/breadcrumb/texto)."
+            )
+        elif (
+            embudo.get("pares_validos_con_score", 0) > 0
+            and embudo.get("pares_seleccionados", 0) == 0
+            and score_max is not None
+            and score_minimo_usado is not None
+            and score_max < score_minimo_usado
+        ):
+            st.error(
+                f"**Aquí está el bloqueo:** el 'Score mínimo para proponer un "
+                f"enlace' está configurado en **{score_minimo_usado:.2f}**, pero "
+                f"el score más alto que se ha conseguido calcular con estos "
+                f"datos es **{score_max:.2f}**. Baja ese slider en la sección 2 "
+                f"(configuración del scoring) — con 0.0 nunca descarta nada por "
+                f"score."
+            )
+        elif embudo.get("pares_seleccionados", 0) == 0 and embudo.get("pares_pendientes_confirmar", 0) == 0:
+            st.warning(
+                "Ninguna fila ha quedado seleccionada, aunque hay pares con "
+                "score calculado. Prueba a bajar el 'Score mínimo para "
+                "proponer un enlace' en la sección 2."
+            )
+
+        with st.expander("Ver todos los números del embudo"):
+            st.json(embudo)
