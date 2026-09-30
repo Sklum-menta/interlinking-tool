@@ -25,7 +25,12 @@ from core.data_loader import (
     load_taxonomia,
     load_volumen,
 )
-from core.scoring import build_formato_ancho, comparar_evolucion_search_console, generate_link_proposals
+from core.scoring import (
+    build_formato_ancho,
+    comparar_evolucion_search_console,
+    diagnosticar_datasets,
+    generate_link_proposals,
+)
 
 st.set_page_config(
     page_title="Interlinking SEO — Sklum",
@@ -594,6 +599,19 @@ if generar:
             st.session_state["propuesta"] = resultado
             st.success(f"Propuesta generada: {len(resultado)} filas.")
 
+            st.session_state["ultimo_diagnostico"] = None
+            if resultado.empty:
+                try:
+                    st.session_state["ultimo_diagnostico"] = diagnosticar_datasets(
+                        datasets,
+                        relevancia_categoria=relevancia_manual,
+                        prioridad_negocio=prioridad_manual,
+                        grupos_aislados=grupos_aislados,
+                        search_console=search_console_actual,
+                    )
+                except Exception:  # noqa: BLE001 - el diagnóstico nunca debe tapar el resultado real
+                    st.session_state["ultimo_diagnostico"] = None
+
             st.session_state["evolucion_sc"] = None
             if search_console_actual is not None and sc_anterior_file is not None:
                 try:
@@ -732,3 +750,24 @@ if resultado is not None and not resultado.empty:
         )
 elif resultado is not None:
     st.info("La propuesta generada está vacía: revisa que los datasets tengan URLs en común.")
+
+    diagnostico = st.session_state.get("ultimo_diagnostico")
+    if diagnostico:
+        st.subheader("🔍 Por qué ha salido vacía")
+        motivo = diagnostico.get("motivo_probable")
+        if motivo:
+            st.warning(f"**Causa más probable:** {motivo}")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("URLs en el crawl", diagnostico.get("n_crawl", 0))
+        c2.metric("... con volumen", diagnostico.get("urls_crawl_con_volumen", 0))
+        c3.metric("... con taxonomía", diagnostico.get("urls_crawl_con_taxonomia", 0))
+        c4.metric("Enlaces existentes leídos", diagnostico.get("n_enlaces", 0))
+
+        if "n_destino_saludable" in diagnostico:
+            c5, c6 = st.columns(2)
+            c5.metric("Destinos 'saludables'", diagnostico.get("n_destino_saludable", 0))
+            c6.metric("Categorías principales distintas", diagnostico.get("n_categorias_principales_distintas", 0))
+
+        with st.expander("Ver detalle completo del diagnóstico"):
+            st.json(diagnostico)
