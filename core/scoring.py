@@ -510,7 +510,7 @@ def _calcular_scores_bloque(
 
     score = (
         weights.volumen_busqueda * pairs["norm_volumen_destino"]
-        + weights.pocos_productos * pairs["norm_pocos_productos_destino"]
+        + weights.muchos_productos * pairs["norm_muchos_productos_destino"]
         + weights.pocos_enlaces_entrantes * pairs["norm_pocos_enlaces_destino"]
         + weights.afinidad_categoria * afinidad.fillna(0.0)
         + weights.relevancia_categoria * pairs["relevancia_categoria_destino"]
@@ -614,7 +614,7 @@ def _seleccionar_con_presupuesto_destino(
     las filas.
 
     Sin el cupo por destino, unas pocas categorías "ganadoras a priori"
-    (mucho volumen, pocos productos, pocos enlaces entrantes de
+    (mucho volumen, muchos productos, pocos enlaces entrantes de
     partida...) se llevaban la inmensa mayoría de los enlaces nuevos
     -algunas repetidas más de 70 veces, como orígenes distintas- mientras
     cientos de categorías del catálogo se quedaban sin ningún enlace
@@ -723,7 +723,12 @@ def generate_link_proposals(
         return pd.DataFrame(columns=RESULT_COLUMNS)
 
     master["norm_volumen"] = _normalize_min_max(master["volumen"])
-    master["norm_pocos_productos"] = _normalize_min_max(master["num_productos"], invert=True)
+    # Decisión de negocio del 30 sept: cuantos MÁS productos tenga la
+    # categoría destino, más prioridad — antes era al revés (invert=True,
+    # favorecía a las categorías con pocos productos). Interesa reforzar
+    # con enlaces internos a las categorías con más catálogo, no compensar
+    # a las pequeñas.
+    master["norm_muchos_productos"] = _normalize_min_max(master["num_productos"])
     master["norm_pocos_enlaces"] = _normalize_min_max(
         master["enlaces_entrantes_actuales"], invert=True
     )
