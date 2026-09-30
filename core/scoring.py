@@ -105,6 +105,12 @@ def build_master_table(
     master["falta_taxonomia"] = master["categoria_principal"].isna() | (
         master["categoria_principal"].astype(str).str.strip() == ""
     )
+    # Igual que `falta_volumen`/`falta_taxonomia`: si el nº de productos no
+    # se ha podido interpretar (columna vacía, o texto en un formato que
+    # `_parse_num_productos` no reconoce), NO se asume un valor por
+    # defecto — la URL se marca pendiente de confirmar en vez de dejar
+    # que el score salga silenciosamente en NaN (ver `_calcular_scores_bloque`).
+    master["falta_num_productos"] = master["num_productos"].isna()
 
     if "status_code" not in master.columns:
         master["status_code"] = float("nan")
@@ -438,19 +444,27 @@ def _calcular_scores_bloque(
     falta_volumen_destino = pairs["falta_volumen_destino"]
     falta_taxonomia_destino = pairs["falta_taxonomia_destino"]
     falta_taxonomia_origen = pairs["falta_taxonomia_origen"]
+    falta_num_productos_destino = pairs["falta_num_productos_destino"]
 
-    pendiente = falta_volumen_destino | falta_taxonomia_destino | falta_taxonomia_origen | afinidad.isna()
+    pendiente = (
+        falta_volumen_destino
+        | falta_taxonomia_destino
+        | falta_taxonomia_origen
+        | falta_num_productos_destino
+        | afinidad.isna()
+    )
 
-    # El motivo textual solo depende de qué combinación de las 3 señales
-    # de "falta X" está activa (8 combinaciones posibles) — se calcula una
-    # vez por combinación, no fila a fila, y se asigna con `.map`.
+    # El motivo textual solo depende de qué combinación de las 4 señales
+    # de "falta X" está activa (16 combinaciones posibles) — se calcula
+    # una vez por combinación, no fila a fila, y se asigna con `.map`.
     combo = (
         falta_volumen_destino.astype(int)
         + falta_taxonomia_destino.astype(int) * 2
         + falta_taxonomia_origen.astype(int) * 4
+        + falta_num_productos_destino.astype(int) * 8
     )
     motivo_por_combo = {}
-    for c in range(8):
+    for c in range(16):
         partes_c = []
         if c & 1:
             partes_c.append("categoría destino sin volumen de búsqueda")
@@ -458,6 +472,8 @@ def _calcular_scores_bloque(
             partes_c.append("categoría destino sin categorización")
         if c & 4:
             partes_c.append("categoría origen sin categorización")
+        if c & 8:
+            partes_c.append("categoría destino sin nº de productos")
         motivo_por_combo[c] = "; ".join(partes_c)
     motivo = combo.map(motivo_por_combo)
     # Caso residual: afinidad no calculable sin que ninguna de las 3
@@ -536,6 +552,7 @@ def generate_link_proposals(
     grupos_aislados: list[str] | None = None,
     search_console: pd.DataFrame | None = None,
     oportunidad: OportunidadSEO | None = None,
+    contador: dict | None = None,
 ) -> pd.DataFrame:
     """Genera la propuesta de interlinking completa.
 
@@ -560,11 +577,35 @@ def generate_link_proposals(
     del MISMO patrón. Nunca se mezclan entre grupos distintos, ni con el
     resto del catálogo. Es una restricción dura: los pares que la
     incumplen ni siquiera se generan como candidatos.
+
+    `contador`, si se pasa un dict (aunque sea vacío), se rellena con el
+    nº de pares que sobreviven en cada etapa del filtrado (pensado para
+    diagnosticar por qué una propuesta ha salido vacía sin tener que
+    adivinar en qué paso se ha quedado en 0 — ver `diagnosticar_datasets`
+    más abajo). No afecta al resultado devuelto ni al comportamiento si
+    se deja en `None` (el valor por defecto).
     """
     weights = (weights or ScoringWeights()).normalizados()
     affinity = affinity or AffinityScores()
     limites = limites or LimitesPropuesta()
     oportunidad = oportunidad or OportunidadSEO()
+
+    if contador is not None:
+        contador.update(
+            {
+                "score_minimo_usado": limites.score_minimo,
+                "max_enlaces_nuevos_por_origen_usado": limites.max_enlaces_nuevos_por_origen,
+                "pares_antes_de_filtros": 0,
+                "pares_tras_grupo_aislado": 0,
+                "pares_tras_salud_destino": 0,
+                "pares_tras_excluir_enlaces_existentes": 0,
+                "pares_pendientes_confirmar": 0,
+                "pares_validos_con_score": 0,
+                "score_valido_minimo": None,
+                "score_valido_maximo": None,
+                "pares_seleccionados": 0,
+            }
+        )
 
     master = build_master_table(
         datasets, relevancia_categoria, prioridad_negocio, grupos_aislados, search_console
@@ -639,11 +680,15 @@ def generate_link_proposals(
             .merge(destino_df.assign(_key=1), on="_key")
             .drop(columns="_key")
         )
+        if contador is not None:
+            contador["pares_antes_de_filtros"] += len(pairs)
 
         # Restricción dura de grupos aislados (Black Friday, Rebajas...):
         # solo se permite el par si origen y destino están en el mismo
         # grupo (o ambos son categorías "normales", grupo_aislado == "").
         pairs = pairs[pairs["grupo_aislado_origen"] == pairs["grupo_aislado_destino"]]
+        if contador is not None:
+            contador["pares_tras_grupo_aislado"] += len(pairs)
         if pairs.empty:
             continue
 
@@ -651,17 +696,39 @@ def generate_link_proposals(
         # una URL caída, redirigida o no indexable (si ese dato está
         # disponible).
         pairs = pairs[pairs["destino_saludable_destino"]]
+        if contador is not None:
+            contador["pares_tras_salud_destino"] += len(pairs)
         if pairs.empty:
             continue
 
         candidate_pairs = pairs[["origen", "destino"]].copy()
         kept = exclude_existing_links(candidate_pairs, datasets.enlaces)
         pairs = pairs.merge(kept, on=["origen", "destino"], how="inner")
+        if contador is not None:
+            contador["pares_tras_excluir_enlaces_existentes"] += len(pairs)
         if pairs.empty:
             continue
 
         pairs = _calcular_scores_bloque(pairs, weights, affinity)
+        if contador is not None:
+            pendientes = pairs["pendiente_confirmar"]
+            validos = pairs.loc[~pendientes, "score"]
+            contador["pares_pendientes_confirmar"] += int(pendientes.sum())
+            contador["pares_validos_con_score"] += int((~pendientes).sum())
+            if not validos.empty:
+                bloque_min = float(validos.min())
+                bloque_max = float(validos.max())
+                actual_min = contador["score_valido_minimo"]
+                actual_max = contador["score_valido_maximo"]
+                contador["score_valido_minimo"] = (
+                    bloque_min if actual_min is None else min(actual_min, bloque_min)
+                )
+                contador["score_valido_maximo"] = (
+                    bloque_max if actual_max is None else max(actual_max, bloque_max)
+                )
         pairs = _recortar_bloque_a_lo_relevante(pairs, limites)
+        if contador is not None:
+            contador["pares_seleccionados"] += int(pairs["seleccionada"].sum())
         if pairs.empty:
             continue
         bloques_resultado.append(pairs)

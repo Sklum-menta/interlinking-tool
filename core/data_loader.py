@@ -256,11 +256,19 @@ PRODUCTOS_CANDIDATES = [
 
 _NUM_PRODUCTOS_DE_RE = re.compile(r"de\s+([\d.,]+)\s*$", re.IGNORECASE)
 
+# Formato real encontrado en el export de Sklum de septiembre 2026: el
+# número va al PRINCIPIO de la cadena, seguido del texto de la categoría
+# ("61 productos en Armarios", "353 productos en Objetos decoración").
+# Se exige al menos un carácter no-numérico después del número (y no solo
+# espacio) para no confundirlo con un número "limpio" con espacios de
+# miles sueltos.
+_NUM_PRODUCTOS_INICIO_RE = re.compile(r"^\s*([\d.,]+)\s+\S")
+
 
 def _parse_num_productos(raw: pd.Series) -> pd.Series:
     """Convierte la columna de nº de productos a numérico.
 
-    Soporta dos formatos reales observados:
+    Soporta tres formatos reales observados:
     - Un número "limpio" (bien como dtype numérico real al leer un
       .xlsx, bien como texto con posible separador de miles con punto y
       decimales con coma, estilo es-ES: "3.978" -> 3978).
@@ -270,10 +278,19 @@ def _parse_num_productos(raw: pd.Series) -> pd.Series:
       productos de la categoría es el que va después de "de" al final
       de la cadena (66), no el "50" (productos mostrados en esa
       página).
+    - "61 productos en Armarios": el número real va al PRINCIPIO de la
+      cadena, seguido de "productos en <categoría>". A diferencia del
+      caso anterior, aquí SÍ es el primer número el que interesa (no hay
+      un segundo número "de X" al final).
+
+    Se prueban los tres en ese orden (limpio → "de X" al final → número
+    al principio) y se usa el primero que dé un resultado válido; si
+    ninguno aplica (texto irreconocible, fila vacía o corrupta), el valor
+    queda en NaN — no se asume un valor por defecto como 0.
     """
     if pd.api.types.is_numeric_dtype(raw):
-        # Si la columna ya es numérica no puede contener el texto del
-        # paginador, así que no hay nada más que limpiar.
+        # Si la columna ya es numérica no puede contener ninguno de los
+        # formatos de texto anteriores, así que no hay nada más que limpiar.
         return pd.to_numeric(raw, errors="coerce")
 
     text = raw.astype(str).str.strip()
@@ -286,7 +303,14 @@ def _parse_num_productos(raw: pd.Series) -> pd.Series:
         errors="coerce",
     )
 
-    return directo.where(directo.notna(), de_valor)
+    inicio_match = text.str.extract(_NUM_PRODUCTOS_INICIO_RE)[0]
+    inicio_valor = pd.to_numeric(
+        inicio_match.map(lambda v: _clean_es_number_text(v) if isinstance(v, str) else v),
+        errors="coerce",
+    )
+
+    combinado = directo.where(directo.notna(), de_valor)
+    return combinado.where(combinado.notna(), inicio_valor)
 
 
 STATUS_CODE_CANDIDATES = ["Status_Code", "Status Code", "Codigo_Estado", "HTTP_Status", "Codigo Estado"]
