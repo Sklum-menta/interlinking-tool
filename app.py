@@ -453,7 +453,7 @@ with col_rel:
                 st.session_state["relevancia_tabla"] = categorias_disponibles.assign(relevancia=0.5)
             else:
                 st.session_state["relevancia_tabla"] = pd.DataFrame(
-                columns=["categoria_principal", "categoria_secundaria", "relevancia"]
+                    columns=["categoria_principal", "categoria_secundaria", "relevancia"]
                 )
 
         if st.button(
@@ -685,9 +685,9 @@ if resultado is not None and not resultado.empty:
             mime="text/csv",
             disabled=formato_ancho.empty,
             help=(
-                "Una fila por URL origen, con su id y los enlaces ya ",
-                "seleccionados como linked_id_1/linked_url_1, ",
-                "linked_id_2/linked_url_2... (mismo formato que el flujo ",
+                "Una fila por URL origen, con su id y los enlaces ya "
+                "seleccionados como linked_id_1/linked_url_1, "
+                "linked_id_2/linked_url_2... (mismo formato que el flujo "
                 "anterior de Sheets)."
             ),
         )
