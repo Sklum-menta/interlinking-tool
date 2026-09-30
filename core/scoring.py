@@ -166,7 +166,7 @@ def build_master_table(
         master["prioridad_negocio"] = 0.0
     master["prioridad_negocio"] = master["prioridad_negocio"].fillna(0.0)
 
-    patrones_grupo = list(grupos_aislados) if grupos_aislados is not None else list(DEFAULT_GRUPOS_AISLADOS)
+    patrones_grupo = _combinar_con_grupos_obligatorios(grupos_aislados)
     master["grupo_aislado"] = master.apply(
         lambda r: _detectar_grupo_aislado(r["categoria_principal"], r["categoria_secundaria"], patrones_grupo),
         axis=1,
@@ -182,7 +182,32 @@ def build_master_table(
 # de scoring: si no coinciden, el par ni siquiera se genera como candidato.
 # ---------------------------------------------------------------------------
 
-DEFAULT_GRUPOS_AISLADOS: tuple[str, ...] = ("black friday", "rebajas", "special price")
+DEFAULT_GRUPOS_AISLADOS: tuple[str, ...] = ("black friday", "rebajas", "special price", "navidad")
+
+
+def _combinar_con_grupos_obligatorios(grupos_aislados: list[str] | None) -> list[str]:
+    """Combina los patrones que pase el usuario (UI o llamada directa) con los
+    4 grupos OBLIGATORIOS de `DEFAULT_GRUPOS_AISLADOS`.
+
+    Regla de negocio confirmada explícitamente por el cliente: Black Friday,
+    Rebajas, Special Price y Navidad NUNCA pueden enlazarse entre sí ni con
+    el resto del catálogo — cada uno solo enlaza dentro de su propio grupo.
+    Esto no es una preferencia configurable: da igual que `grupos_aislados`
+    llegue vacío, con solo alguno de los 4, o incluso como `[]` explícito
+    (por ejemplo si alguien borra el cuadro de texto de la interfaz por
+    error) — los 4 patrones por defecto se aplican SIEMPRE. `grupos_aislados`
+    solo sirve para AÑADIR grupos aislados extra por encima de esos 4, nunca
+    para quitarlos.
+    """
+    combinados = list(DEFAULT_GRUPOS_AISLADOS)
+    if grupos_aislados:
+        existentes = {p.strip().lower() for p in combinados}
+        for patron in grupos_aislados:
+            p = str(patron).strip()
+            if p and p.lower() not in existentes:
+                combinados.append(p)
+                existentes.add(p.lower())
+    return combinados
 
 
 def _detectar_grupo_aislado(
@@ -569,14 +594,16 @@ def generate_link_proposals(
     pero se conservan en la tabla para que el equipo las revise y
     complete los datos que faltan.
 
-    `grupos_aislados` es una lista de patrones (por defecto
-    `DEFAULT_GRUPOS_AISLADOS` = Black Friday, Rebajas y Special Price):
-    una categoría
+    `grupos_aislados` es una lista de patrones ADICIONALES a los 4
+    obligatorios de `DEFAULT_GRUPOS_AISLADOS` (Black Friday, Rebajas,
+    Special Price y Navidad), que se aplican SIEMPRE pase lo que pase en
+    este parámetro (ver `_combinar_con_grupos_obligatorios`): una categoría
     que coincide con uno de estos patrones (en su categoría principal o
     secundaria) SOLO puede enlazar, y ser enlazada, por otras categorías
     del MISMO patrón. Nunca se mezclan entre grupos distintos, ni con el
-    resto del catálogo. Es una restricción dura: los pares que la
-    incumplen ni siquiera se generan como candidatos.
+    resto del catálogo. Es una restricción dura de negocio, no configurable
+    a la baja: los pares que la incumplen ni siquiera se generan como
+    candidatos.
 
     `contador`, si se pasa un dict (aunque sea vacío), se rellena con el
     nº de pares que sobreviven en cada etapa del filtrado (pensado para
@@ -849,7 +876,7 @@ def diagnosticar_datasets(
             str(k): int(v) for k, v in master["indexable"].value_counts(dropna=False).items()
         }
 
-    patrones_grupo = list(grupos_aislados) if grupos_aislados is not None else list(DEFAULT_GRUPOS_AISLADOS)
+    patrones_grupo = _combinar_con_grupos_obligatorios(grupos_aislados)
     grupo_aislado = master.apply(
         lambda r: _detectar_grupo_aislado(r["categoria_principal"], r["categoria_secundaria"], patrones_grupo),
         axis=1,
