@@ -618,7 +618,15 @@ resultado: pd.DataFrame | None = st.session_state.get("propuesta")
 if resultado is not None and not resultado.empty:
     st.header("5. Resultado")
 
-    fc1, fc2, fc3 = st.columns(3)
+    st.caption(
+        "Esta tabla ya es la propuesta final: solo los enlaces seleccionados "
+        "(top de cada categoría origen) más las filas pendientes de revisar "
+        "por falta de datos. Los candidatos válidos que no entraron en el "
+        "límite por origen no se guardan (con catálogos grandes serían "
+        "millones de filas), así que no hace falta filtrarlos aquí."
+    )
+
+    fc1, fc2 = st.columns(2)
     with fc1:
         categorias_principales = sorted(
             resultado["categoria_principal_destino"].dropna().astype(str).unique().tolist()
@@ -626,14 +634,10 @@ if resultado is not None and not resultado.empty:
         filtro_categoria = st.multiselect("Filtrar por categoría principal (destino)", categorias_principales)
     with fc2:
         filtro_score_min = st.slider("Score mínimo a mostrar", 0.0, 1.0, 0.0, 0.05)
-    with fc3:
-        solo_seleccionadas = st.checkbox("Mostrar solo las propuestas seleccionadas", value=True)
 
     vista = resultado.copy()
     if filtro_categoria:
         vista = vista[vista["categoria_principal_destino"].astype(str).isin(filtro_categoria)]
-    if solo_seleccionadas:
-        vista = vista[vista["seleccionada"] | vista["pendiente_confirmar"]]
     vista = vista[(vista["score"].fillna(1.0) >= filtro_score_min) | vista["pendiente_confirmar"]]
 
     def _badge(row):
@@ -658,20 +662,28 @@ if resultado is not None and not resultado.empty:
     )
 
     st.subheader("Descargar propuesta")
+    st.caption(
+        "👉 Para compartir con el equipo o importar en Sheets, usa la de la "
+        "derecha (**formato id + enlaces**): una fila por categoría origen, "
+        "con categoría/subcategoría/score y una justificación de cada "
+        "enlace propuesto. Las otras dos son la tabla técnica completa "
+        "(un candidato por fila), útiles para depurar el scoring."
+    )
     dcol1, dcol2, dcol3 = st.columns(3)
     with dcol1:
         st.download_button(
-            "⬇️ Descargar CSV",
+            "⬇️ Descargar CSV (técnico)",
             data=resultado.to_csv(index=False).encode("utf-8-sig"),
             file_name="propuesta_interlinking.csv",
             mime="text/csv",
+            help="Una fila por par origen-destino seleccionado o pendiente de revisar, con todas las señales de scoring.",
         )
     with dcol2:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             resultado.to_excel(writer, index=False, sheet_name="Propuesta")
         st.download_button(
-            "⬇️ Descargar Excel",
+            "⬇️ Descargar Excel (técnico)",
             data=buffer.getvalue(),
             file_name="propuesta_interlinking.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -679,16 +691,17 @@ if resultado is not None and not resultado.empty:
     with dcol3:
         formato_ancho = build_formato_ancho(resultado)
         st.download_button(
-            "⬇️ Descargar CSV (formato id + enlaces)",
+            "⬇️ Descargar propuesta final (recomendado)",
             data=formato_ancho.to_csv(index=False).encode("utf-8-sig"),
             file_name="propuesta_interlinking_formato_ancho.csv",
             mime="text/csv",
             disabled=formato_ancho.empty,
             help=(
-                "Una fila por URL origen, con su id y los enlaces ya "
-                "seleccionados como linked_id_1/linked_url_1, "
-                "linked_id_2/linked_url_2... (mismo formato que el flujo "
-                "anterior de Sheets)."
+                "Una fila por URL origen, con su id, categoría/subcategoría "
+                "y los enlaces ya seleccionados: linked_id_1/linked_url_1/"
+                "linked_category_1/linked_subcategory_1/linked_score_1/"
+                "justificacion_1, linked_id_2/... (mismo formato que el "
+                "flujo anterior de Sheets, con la justificación añadida)."
             ),
         )
 
