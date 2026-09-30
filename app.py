@@ -281,6 +281,23 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             help="Descarta candidatas por debajo de este score, aunque entrarían dentro del máximo de arriba. 0 = no descarta ninguna por score.",
         )
 
+    max_enlaces_destino = st.number_input(
+        "Máx. enlaces nuevos que puede RECIBIR una misma categoría destino",
+        min_value=1,
+        max_value=50,
+        value=8,
+        help=(
+            "Evita que unas pocas categorías 'ganadoras' (mucho volumen, pocos "
+            "productos, pocos enlaces entrantes de partida...) se lleven la "
+            "mayoría de los enlaces nuevos mientras el resto del catálogo se "
+            "queda sin ninguno. Con este límite, cuando una categoría destino "
+            "ya ha recibido este nº de enlaces nuevos en la propuesta, deja de "
+            "proponerse como destino y el siguiente mejor candidato de cada "
+            "origen ocupa su lugar — así los enlaces nuevos se reparten por "
+            "más categorías en vez de repetirse siempre en las mismas."
+        ),
+    )
+
     st.markdown(
         "**Página origen** (0.0 = no afectan; miran a la categoría que enlaza, no a la que recibe el enlace)"
     )
@@ -397,6 +414,7 @@ affinity = AffinityScores(
 limites = LimitesPropuesta(
     max_enlaces_nuevos_por_origen=int(max_enlaces),
     score_minimo=score_minimo,
+    max_enlaces_nuevos_por_destino=int(max_enlaces_destino),
 )
 oportunidad = OportunidadSEO(posicion_min=posicion_min, posicion_max=posicion_max)
 
