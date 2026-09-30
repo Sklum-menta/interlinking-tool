@@ -7,6 +7,7 @@ from core.scoring import (
     build_formato_ancho,
     build_master_table,
     comparar_evolucion_search_console,
+    diagnosticar_datasets,
     extraer_id_de_url,
     generate_link_proposals,
     oportunidad_posicion_score,
@@ -161,8 +162,8 @@ def test_prioridad_negocio_manual_por_url_reordena_la_propuesta():
 
 def _make_datasets_con_grupos_aislados() -> InputDatasets:
     # bf1/bf2: Black Friday. reb1/reb2: Rebajas. sp1/sp2: Special Price.
-    # n1/n2: categorías normales.
-    urls = ["bf1", "bf2", "reb1", "reb2", "sp1", "sp2", "n1", "n2"]
+    # nav1/nav2: Navidad. n1/n2: categorías normales.
+    urls = ["bf1", "bf2", "reb1", "reb2", "sp1", "sp2", "nav1", "nav2", "n1", "n2"]
     crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
     volumen = pd.DataFrame(
         {
@@ -181,6 +182,8 @@ def _make_datasets_con_grupos_aislados() -> InputDatasets:
                 "Precios especiales",
                 "Sofas",
                 "Sillas",
+                "Decoración",
+                "Decoración",
                 "Muebles",
                 "Muebles",
             ],
@@ -191,6 +194,8 @@ def _make_datasets_con_grupos_aislados() -> InputDatasets:
                 "Rebajas",
                 "Special Price",
                 "Special Price",
+                "Navidad",
+                "Navidad",
                 "Salon",
                 "Salon",
             ],
@@ -256,8 +261,73 @@ def test_grupos_aislados_special_price_no_se_mezcla_con_black_friday_ni_rebajas(
     pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
     assert ("sp1", "bf1") not in pares
     assert ("bf1", "sp1") not in pares
+
+
+def test_grupos_aislados_navidad_solo_enlaza_con_navidad():
+    """Navidad (confirmada por el usuario el 30 sept, encontrada también
+    en la taxonomía real de Sklum con 13 URLs) se aísla igual que Black
+    Friday, Rebajas y Special Price: solo se enlaza consigo misma."""
+    datasets = _make_datasets_con_grupos_aislados()
+    resultado = generate_link_proposals(datasets)
+
+    desde_nav1 = resultado[resultado["categoria_origen"] == "nav1"]
+    destinos = set(desde_nav1["categoria_destino"])
+    assert destinos == {"nav2"}
+
+
+def test_grupos_aislados_navidad_no_se_mezcla_con_otros_grupos_ni_normales():
+    datasets = _make_datasets_con_grupos_aislados()
+    resultado = generate_link_proposals(datasets)
+
+    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
+    assert ("nav1", "bf1") not in pares
+    assert ("nav1", "sp1") not in pares
+    assert ("nav1", "n1") not in pares
+    assert ("n1", "nav1") not in pares
     assert ("sp1", "reb1") not in pares
     assert ("reb1", "sp1") not in pares
+
+
+def test_grupos_aislados_obligatorios_no_se_pueden_desactivar_pasando_lista_vacia():
+    """Regla de negocio confirmada por el usuario el 30 sept: Black Friday,
+    Rebajas, Special Price y Navidad NUNCA se mezclan entre sí, y esto no
+    puede depender de que alguien borre o deje vacío el cuadro de
+    'categorías aisladas' de la interfaz (o llame a la función pasando
+    `grupos_aislados=[]` directamente). Aunque se pase una lista vacía, los
+    4 grupos obligatorios se siguen aplicando igual que si no se pasara
+    nada (`grupos_aislados=None`).
+    """
+    datasets = _make_datasets_con_grupos_aislados()
+    resultado = generate_link_proposals(datasets, grupos_aislados=[])
+
+    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
+    # Ningún cruce entre grupos aislados distintos, ni con categorías normales.
+    assert ("sp1", "bf1") not in pares
+    assert ("bf1", "sp1") not in pares
+    assert ("sp1", "reb1") not in pares
+    assert ("bf1", "reb1") not in pares
+    assert ("nav1", "bf1") not in pares
+    assert ("nav1", "n1") not in pares
+    # Y cada grupo se sigue enlazando consigo mismo con normalidad.
+    assert ("bf1", "bf2") in pares or ("bf2", "bf1") in pares
+    assert ("sp1", "sp2") in pares or ("sp2", "sp1") in pares
+
+
+def test_grupos_aislados_parametro_solo_anade_grupos_extra_nunca_quita_los_obligatorios():
+    """Pasar `grupos_aislados` con patrones custom (p.ej. desde el cuadro de
+    texto de 'categorías aisladas adicionales' en la interfaz) añade esos
+    grupos por encima de los 4 obligatorios, pero nunca los sustituye ni
+    los desactiva.
+    """
+    datasets = _make_datasets_con_grupos_aislados()
+    resultado = generate_link_proposals(datasets, grupos_aislados=["salon"])
+
+    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
+    # El grupo extra ("Salon") se aísla...
+    assert ("n1", "n2") in pares or ("n2", "n1") in pares  # n1/n2 son ambas "Salon"
+    # ...y los 4 obligatorios se mantienen intactos.
+    assert ("sp1", "bf1") not in pares
+    assert ("bf1", "sp1") not in pares
 
 
 # ---------------------------------------------------------------------------
@@ -607,3 +677,160 @@ def test_generate_link_proposals_no_cambia_al_procesar_por_bloques_pequenos():
     pd.testing.assert_frame_equal(
         original.reset_index(drop=True), con_bloques_de_1.reset_index(drop=True)
     )
+
+
+# ---------------------------------------------------------------------------
+# diagnosticar_datasets: diagnóstico automático de por qué una propuesta
+# ha salido vacía (o casi vacía)
+# ---------------------------------------------------------------------------
+
+
+def test_diagnosticar_datasets_caso_sano_no_da_motivo_de_bloqueo_total():
+    """Con un dataset normal (el mismo que usan el resto de tests, donde
+    SÍ se generan filas) el diagnóstico no debe señalar ni la salud
+    técnica ni la taxonomía como causa de bloqueo total: como mucho el
+    motivo genérico de "no se descarta nada por los filtros básicos".
+    """
+    datasets = _make_datasets()
+    diagnostico = diagnosticar_datasets(datasets)
+
+    assert diagnostico["n_crawl"] == 4
+    assert diagnostico["urls_crawl_con_volumen"] == 3
+    assert diagnostico["urls_crawl_con_taxonomia"] == 4
+    assert diagnostico["n_destino_saludable"] == 4
+    assert "columna equivocada" not in diagnostico["motivo_probable"]
+    assert "taxonomía asociada" not in diagnostico["motivo_probable"]
+
+
+def test_diagnosticar_datasets_detecta_columna_de_salud_mal_detectada():
+    """Si (por un mapeo de columnas equivocado, p.ej. una columna real
+    llamada "No_Indexable" detectada como si fuera "Indexable") todas las
+    URLs quedan marcadas como no indexables, el diagnóstico debe
+    señalarlo como la causa más probable de que la propuesta salga
+    vacía, en vez de limitarse al mensaje genérico.
+    """
+    datasets = _make_datasets()
+    datasets.crawl = datasets.crawl.copy()
+    datasets.crawl["indexable"] = False  # todas las URLs "no indexables"
+
+    diagnostico = diagnosticar_datasets(datasets)
+
+    assert diagnostico["n_destino_saludable"] == 0
+    assert "columna equivocada" in diagnostico["motivo_probable"] or "columna distinta" in diagnostico["motivo_probable"]
+
+
+def test_diagnosticar_datasets_detecta_taxonomia_sin_solape_con_crawl():
+    """Si el crawl y la taxonomía no comparten ninguna URL (p.ej. porque
+    se ha usado una columna de URL distinta para cada uno dentro del
+    mismo fichero), el diagnóstico debe señalarlo explícitamente en vez
+    de quedarse en el motivo genérico de categorías compartidas.
+    """
+    datasets = _make_datasets()
+    datasets.taxonomia = pd.DataFrame(
+        {
+            "url": ["x", "y", "z", "w"],
+            "categoria_principal": ["Muebles", "Muebles", "Iluminacion", "Muebles"],
+            "categoria_secundaria": ["Salon", "Salon", "Techo", "Dormitorio"],
+        }
+    )
+
+    diagnostico = diagnosticar_datasets(datasets)
+
+    assert diagnostico["urls_crawl_con_taxonomia"] == 0
+    assert diagnostico["n_categorias_principales_distintas"] <= 1
+    assert "Categoria_Principal" in diagnostico["motivo_probable"]
+
+
+def test_diagnosticar_datasets_con_menos_de_dos_urls_de_crawl():
+    datasets = _make_datasets()
+    datasets.crawl = datasets.crawl.iloc[:1].copy()
+
+    diagnostico = diagnosticar_datasets(datasets)
+
+    assert "menos de 2 URLs" in diagnostico["motivo_probable"]
+    assert "n_master" not in diagnostico
+
+
+# ---------------------------------------------------------------------------
+# generate_link_proposals(..., contador=...): diagnóstico del embudo de
+# filtrado, pensado para detectar en qué paso una propuesta se queda en
+# 0 filas (grupos aislados, salud del destino, enlaces ya existentes o un
+# score_minimo demasiado alto).
+# ---------------------------------------------------------------------------
+
+
+def test_contador_no_cambia_el_resultado_ni_falla_si_es_none():
+    datasets = _make_datasets()
+    sin_contador = generate_link_proposals(datasets)
+    con_contador = generate_link_proposals(datasets, contador={})
+    pd.testing.assert_frame_equal(
+        sin_contador.reset_index(drop=True), con_contador.reset_index(drop=True)
+    )
+
+
+def test_contador_detecta_score_minimo_demasiado_alto():
+    """Si el score mínimo configurado es más alto que cualquier score
+    real alcanzable, la propuesta sale vacía (0 seleccionadas) aunque
+    haya pares candidatos válidos de sobra — el contador debe dejar esto
+    clarísimo: pares_validos_con_score > 0, pero score_valido_maximo por
+    debajo del score_minimo usado, y pares_seleccionados == 0.
+    """
+    datasets = _make_datasets()
+    limites = LimitesPropuesta(max_enlaces_nuevos_por_origen=5, score_minimo=0.999)
+
+    contador: dict = {}
+    resultado = generate_link_proposals(datasets, limites=limites, contador=contador)
+
+    assert contador["pares_validos_con_score"] > 0
+    assert contador["score_valido_maximo"] is not None
+    assert contador["score_valido_maximo"] < 0.999
+    assert contador["pares_seleccionados"] == 0
+    # Las filas "pendiente_confirmar" (datos incompletos) se conservan
+    # siempre, pero ninguna fila válida queda marcada como seleccionada.
+    assert not resultado.empty
+    assert not resultado["seleccionada"].any()
+
+
+def test_falta_num_productos_marca_pendiente_en_vez_de_score_nan_silencioso():
+    """Si a una URL destino le falta el nº de productos (columna vacía o
+    texto irreconocible tras `_parse_num_productos`), la fila debe
+    marcarse `pendiente_confirmar` con un motivo explícito, en vez de
+    quedar como "válida" con un `score` en NaN que desaparece en
+    silencio del resultado final (esto es justo lo que provocaba que el
+    catálogo real de Sklum, con la columna Nº_Productos en un formato de
+    texto no reconocido, generase una propuesta con 0 filas: el score
+    salía en NaN para el 100% de los pares y ninguno superaba nunca el
+    score mínimo, pero tampoco se marcaba pendiente).
+    """
+    datasets = _make_datasets()
+    datasets.crawl = datasets.crawl.copy()
+    # "c" pierde su nº de productos.
+    datasets.crawl.loc[datasets.crawl["url"] == "c", "num_productos"] = float("nan")
+
+    resultado = generate_link_proposals(datasets)
+
+    hacia_c = resultado[resultado["categoria_destino"] == "c"]
+    assert not hacia_c.empty
+    assert hacia_c["pendiente_confirmar"].all()
+    assert hacia_c["score"].isna().all()
+    assert "nº de productos" in hacia_c["motivo_pendiente"].iloc[0]
+
+
+def test_contador_detecta_bloqueo_por_grupos_aislados():
+    """Si TODAS las categorías quedan aisladas en grupos distintos entre
+    sí (p.ej. un patrón de aislamiento tan amplio que separa el catálogo
+    en singletons), el embudo debe mostrar que los pares se pierden ya en
+    el primer filtro (grupo_aislado), antes incluso de llegar a salud
+    técnica o a enlaces existentes.
+    """
+    datasets = _make_datasets()  # categorías: a, b, c, d
+    contador: dict = {}
+    # Un patrón por URL (todas normalizadas a minúsculas) aísla cada
+    # categoría en su propio grupo de 1: ningún par sobrevive al filtro.
+    resultado = generate_link_proposals(
+        datasets, grupos_aislados=["salon", "techo", "dormitorio"], contador=contador
+    )
+
+    assert contador["pares_antes_de_filtros"] > 0
+    assert contador["pares_tras_grupo_aislado"] < contador["pares_antes_de_filtros"]
+    assert resultado is not None
