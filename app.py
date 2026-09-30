@@ -355,16 +355,24 @@ with st.expander("Pesos del scoring y límites", expanded=True):
     with c11:
         w_prioridad = st.slider("Peso: prioridad de negocio manual (URL)", 0.0, 1.0, 0.0, 0.05)
 
-    st.markdown("**Categorías aisladas** (nunca se enlazan con el resto del catálogo, solo entre sí mismas)")
+    st.markdown(
+        "**Categorías aisladas adicionales** — Black Friday, Rebajas, Special Price "
+        "y Navidad NUNCA se enlazan con el resto del catálogo ni entre sí (solo dentro "
+        "de su propio grupo); esta regla de negocio va siempre activa y no se puede "
+        "desactivar desde aquí. Este cuadro es solo para añadir OTROS grupos aislados "
+        "extra, si hiciera falta."
+    )
     grupos_aislados_texto = st.text_area(
-        "Un patrón por línea (se busca como texto, sin distinguir mayúsculas, "
-        "en Categoria_Principal + Categoria_Secundaria de cada URL)",
-        value="Black Friday\nRebajas\nSpecial Price",
+        "Un patrón adicional por línea (opcional; se busca como texto, sin distinguir "
+        "mayúsculas, en Categoria_Principal + Categoria_Secundaria de cada URL). "
+        "Black Friday/Rebajas/Special Price/Navidad no hace falta escribirlos: ya están "
+        "siempre aislados.",
+        value="",
         help=(
-            "Ej. si una URL tiene Categoria_Secundaria='Black Friday', solo podrá "
-            "enlazar (y ser enlazada por) otras URLs cuya categoría también "
-            "contenga 'Black Friday'. Nunca con el resto del catálogo ni con "
-            "otro grupo aislado (p.ej. Rebajas o Special Price)."
+            "Ej. si quieres aislar también, por ejemplo, 'Outlet', escribe 'Outlet' aquí "
+            "y esas URLs solo se enlazarán entre sí. Los 4 grupos obligatorios "
+            "(Black Friday, Rebajas, Special Price, Navidad) siguen aislados aunque "
+            "dejes este cuadro vacío."
         ),
     )
     grupos_aislados = [linea.strip() for linea in grupos_aislados_texto.splitlines() if linea.strip()]
@@ -811,7 +819,7 @@ elif resultado is not None:
         elif embudo.get("pares_tras_grupo_aislado", 0) == 0:
             st.error(
                 "**Aquí está el bloqueo:** el filtro de 'categorías aisladas' "
-                "(sección 2, Black Friday/Rebajas/Special Price o los patrones "
+                "(sección 2, Black Friday/Rebajas/Special Price/Navidad o los patrones "
                 "que tengas configurados ahí) ha descartado TODOS los pares. "
                 "Revisa esa lista de patrones: seguramente coincide con texto "
                 "que aparece en todas (o casi todas) las categorías del "
