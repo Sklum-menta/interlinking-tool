@@ -25,7 +25,7 @@ from core.data_loader import (
     load_taxonomia,
     load_volumen,
 )
-from core.scoring import comparar_evolucion_search_console, generate_link_proposals
+from core.scoring import build_formato_ancho, comparar_evolucion_search_console, generate_link_proposals
 
 st.set_page_config(
     page_title="Interlinking SEO — Sklum",
@@ -435,6 +435,17 @@ with col_rel:
         if cargado_relevancia is not None:
             try:
                 st.session_state["relevancia_tabla"] = load_relevancia_manual(cargado_relevancia)
+                # El widget de abajo (key="relevancia_editor") guarda en
+                # session_state su propio diff de ediciones (filas
+                # editadas/añadidas/borradas) y lo reaplica POR POSICIÓN
+                # sobre lo que le pasemos como tabla base en el próximo
+                # render. Si aquí cambiamos la tabla base (nueva subida)
+                # sin borrar ese diff viejo, Streamlit mezcla ediciones de
+                # la tabla anterior con las filas de la tabla nueva —
+                # combinaciones categoria_principal/categoria_secundaria
+                # que no existen, y filas que desaparecen. Hay que
+                # limpiar el estado del widget para que arranque de cero.
+                st.session_state.pop("relevancia_editor", None)
             except DataLoadError as exc:
                 st.error(str(exc))
         if "relevancia_tabla" not in st.session_state:
@@ -442,7 +453,7 @@ with col_rel:
                 st.session_state["relevancia_tabla"] = categorias_disponibles.assign(relevancia=0.5)
             else:
                 st.session_state["relevancia_tabla"] = pd.DataFrame(
-                    columns=["categoria_principal", "categoria_secundaria", "relevancia"]
+                columns=["categoria_principal", "categoria_secundaria", "relevancia"]
                 )
 
         if st.button(
@@ -451,6 +462,11 @@ with col_rel:
             key="btn_rellenar_relevancia",
         ):
             st.session_state["relevancia_tabla"] = categorias_disponibles.assign(relevancia=0.5)
+            # Mismo motivo que arriba: esta tabla también reemplaza la
+            # base por completo, así que hay que descartar el diff viejo
+            # del editor para que no se reaplique sobre filas que ya no
+            # se corresponden con las mismas categorías.
+            st.session_state.pop("relevancia_editor", None)
 
         relevancia_editada = st.data_editor(
             st.session_state["relevancia_tabla"],
@@ -464,7 +480,7 @@ with col_rel:
         st.session_state["relevancia_tabla"] = relevancia_editada
         st.download_button(
             "⬇️ Descargar esta tabla (para el mes que viene)",
-            data=relevancia_editada.to_csv(index=False).encode("utf-8"),
+            data=relevancia_editada.to_csv(index=False).encode("utf-8-sig"),
             file_name="relevancia_manual_categorias.csv",
             mime="text/csv",
             key="download_relevancia",
@@ -482,6 +498,11 @@ with col_prio:
         if cargado_prioridad is not None:
             try:
                 st.session_state["prioridad_tabla"] = load_prioridad_negocio(cargado_prioridad)
+                # Mismo motivo que en la tabla de relevancia: al reemplazar
+                # la tabla base hay que descartar el diff de ediciones que
+                # el widget guarda bajo su propia key, o Streamlit lo
+                # reaplica por posición sobre filas que ya no son las mismas.
+                st.session_state.pop("prioridad_editor", None)
             except DataLoadError as exc:
                 st.error(str(exc))
         if "prioridad_tabla" not in st.session_state:
@@ -496,7 +517,7 @@ with col_prio:
         st.session_state["prioridad_tabla"] = prioridad_editada
         st.download_button(
             "⬇️ Descargar esta tabla (para el mes que viene)",
-            data=prioridad_editada.to_csv(index=False).encode("utf-8"),
+            data=prioridad_editada.to_csv(index=False).encode("utf-8-sig"),
             file_name="prioridad_negocio_manual.csv",
             mime="text/csv",
             key="download_prioridad",
@@ -637,11 +658,11 @@ if resultado is not None and not resultado.empty:
     )
 
     st.subheader("Descargar propuesta")
-    dcol1, dcol2 = st.columns(2)
+    dcol1, dcol2, dcol3 = st.columns(3)
     with dcol1:
         st.download_button(
             "⬇️ Descargar CSV",
-            data=resultado.to_csv(index=False).encode("utf-8"),
+            data=resultado.to_csv(index=False).encode("utf-8-sig"),
             file_name="propuesta_interlinking.csv",
             mime="text/csv",
         )
@@ -654,6 +675,21 @@ if resultado is not None and not resultado.empty:
             data=buffer.getvalue(),
             file_name="propuesta_interlinking.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with dcol3:
+        formato_ancho = build_formato_ancho(resultado)
+        st.download_button(
+            "⬇️ Descargar CSV (formato id + enlaces)",
+            data=formato_ancho.to_csv(index=False).encode("utf-8-sig"),
+            file_name="propuesta_interlinking_formato_ancho.csv",
+            mime="text/csv",
+            disabled=formato_ancho.empty,
+            help=(
+                "Una fila por URL origen, con su id y los enlaces ya ",
+                "seleccionados como linked_id_1/linked_url_1, ",
+                "linked_id_2/linked_url_2... (mismo formato que el flujo ",
+                "anterior de Sheets)."
+            ),
         )
 
     evolucion: pd.DataFrame | None = st.session_state.get("evolucion_sc")
@@ -676,7 +712,7 @@ if resultado is not None and not resultado.empty:
         )
         st.download_button(
             "⬇️ Descargar evolución (CSV)",
-            data=evolucion_vista.to_csv(index=False).encode("utf-8"),
+            data=evolucion_vista.to_csv(index=False).encode("utf-8-sig"),
             file_name="evolucion_search_console.csv",
             mime="text/csv",
             key="download_evolucion",
