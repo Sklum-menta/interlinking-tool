@@ -532,6 +532,23 @@ def _calcular_scores_bloque(
     return pairs
 
 
+def _margen_candidatos_por_origen(limites: LimitesPropuesta) -> int:
+    """Cuántos candidatos por origen se conservan de cada bloque ANTES de
+    la selección final con presupuesto de destino (ver
+    `_recortar_bloque_a_lo_relevante` y `_seleccionar_con_presupuesto_destino`).
+
+    Tiene que ser mayor que `max_enlaces_nuevos_por_origen`: si el destino
+    mejor puntuado de un origen ya ha agotado su cupo de enlaces nuevos
+    (`max_enlaces_nuevos_por_destino`) porque otros orígenes lo eligieron
+    antes, hace falta tener a mano el siguiente mejor candidato de ESE
+    origen para poder sustituirlo — si solo guardásemos el top 5 "a
+    secas" (como antes de repartir por destino), ese origen se quedaría
+    con menos enlaces de los que le tocan en vez de pasar al siguiente
+    candidato válido.
+    """
+    return max(limites.max_enlaces_nuevos_por_origen * 10, 50)
+
+
 def _recortar_bloque_a_lo_relevante(
     pairs: pd.DataFrame, limites: LimitesPropuesta
 ) -> pd.DataFrame:
@@ -539,32 +556,96 @@ def _recortar_bloque_a_lo_relevante(
     queda solo con lo que de verdad hace falta conservar:
 
     - Los pendientes de confirmar (para que el equipo los revise).
-    - Los que quedan SELECCIONADOS (el top `max_enlaces_nuevos_por_origen`
-      por score, para cada categoría origen del bloque).
+    - Los mejores candidatos por score de cada categoría origen del
+      bloque, con margen de sobra (ver `_margen_candidatos_por_origen`)
+      para que la selección final pueda repartir el presupuesto de
+      enlaces nuevos por destino sin quedarse sin candidatos de reserva.
 
-    El resto -candidatos válidos pero que no entraron en el top-N de su
+    El resto -candidatos válidos que ni de lejos entran en el margen de su
     origen- se descarta aquí mismo. Es la parte que de verdad evita que
-    la propuesta final ocupe O(N²): con un catálogo de miles de URLs,
-    la inmensa mayoría de los pares candidatos son justamente estos (un
-    origen tiene como candidatos a casi todo el catálogo, pero como
-    mucho le hacen falta 5). Cada categoría origen vive entera dentro de
-    un único bloque (el reparto en bloques es por origen, nunca la
-    parte), así que este recorte por bloque da el mismo resultado que
-    hacerlo una vez al final sobre la tabla completa.
+    la propuesta final ocupe O(N²): con un catálogo de miles de URLs, la
+    inmensa mayoría de los pares candidatos son justamente estos (un
+    origen tiene como candidatos a casi todo el catálogo, pero como mucho
+    le hace falta un margen de unas pocas decenas). Cada categoría origen
+    vive entera dentro de un único bloque (el reparto en bloques es por
+    origen, nunca al revés), así que este recorte por bloque no pierde
+    ningún candidato que pudiera hacer falta en la selección final global.
+
+    OJO: la columna `seleccionada` que se rellena aquí es solo una marca
+    provisional para decidir qué conservar en memoria — la selección de
+    verdad (con presupuesto de destino) se recalcula desde cero al final
+    de `generate_link_proposals`, una vez juntados todos los bloques.
     """
     pendiente = pairs["pendiente_confirmar"]
+    margen = _margen_candidatos_por_origen(limites)
 
     validas = pairs[~pendiente].copy()
     validas = validas[validas["score"] >= limites.score_minimo]
     validas = validas.sort_values(["origen", "score"], ascending=[True, False])
     validas["_orden"] = validas.groupby("origen").cumcount()
-    seleccionadas_idx = validas[validas["_orden"] < limites.max_enlaces_nuevos_por_origen].index
+    seleccionadas_idx = validas[validas["_orden"] < margen].index
 
     pairs = pairs.copy()
     pairs["seleccionada"] = False
     pairs.loc[seleccionadas_idx, "seleccionada"] = True
 
     return pairs[pairs["pendiente_confirmar"] | pairs["seleccionada"]]
+
+
+def _seleccionar_con_presupuesto_destino(
+    resultado: pd.DataFrame, limites: LimitesPropuesta
+) -> pd.Series:
+    """Selección final de enlaces nuevos, con dos cupos a la vez:
+
+    - `max_enlaces_nuevos_por_origen`: cuántos enlaces salientes nuevos
+      como mucho por categoría origen (ya existía).
+    - `max_enlaces_nuevos_por_destino`: cuántos enlaces entrantes NUEVOS
+      como mucho puede acumular una misma categoría destino en esta
+      propuesta (nuevo — ver `LimitesPropuesta`).
+
+    Se recorren TODOS los pares válidos (no pendientes) ordenados de
+    mejor a peor score, de forma GLOBAL (no origen por origen), y se
+    acepta cada uno si su origen y su destino todavía tienen hueco en su
+    cupo respectivo. Procesar por score global en vez de por orden de
+    origen es importante: cuando dos orígenes compiten por el mismo
+    destino ya casi lleno, gana el par con mejor score, no el que
+    "llegó antes" por casualidad del orden alfabético de las URLs — así
+    la selección es determinista y no depende de cómo vengan ordenadas
+    las filas.
+
+    Sin el cupo por destino, unas pocas categorías "ganadoras a priori"
+    (mucho volumen, pocos productos, pocos enlaces entrantes de
+    partida...) se llevaban la inmensa mayoría de los enlaces nuevos
+    -algunas repetidas más de 70 veces, como orígenes distintas- mientras
+    cientos de categorías del catálogo se quedaban sin ningún enlace
+    nuevo: un enlazado poco repartido y de baja calidad, justo lo que
+    reportó el usuario al comparar con el script anterior (que sí
+    limitaba cuántos enlaces entrantes nuevos podía recibir cada
+    categoría mediante su columna "En. Obj.").
+    """
+    validas = resultado[~resultado["pendiente_confirmar"]].copy()
+    validas = validas[validas["score"] >= limites.score_minimo]
+    validas = validas.sort_values("score", ascending=False)
+
+    origen_count: dict[str, int] = {}
+    destino_count: dict[str, int] = {}
+    seleccionadas_idx = []
+    max_origen = limites.max_enlaces_nuevos_por_origen
+    max_destino = limites.max_enlaces_nuevos_por_destino
+    for idx, origen, destino in zip(
+        validas.index, validas["categoria_origen"], validas["categoria_destino"]
+    ):
+        if origen_count.get(origen, 0) >= max_origen:
+            continue
+        if destino_count.get(destino, 0) >= max_destino:
+            continue
+        seleccionadas_idx.append(idx)
+        origen_count[origen] = origen_count.get(origen, 0) + 1
+        destino_count[destino] = destino_count.get(destino, 0) + 1
+
+    seleccionada = pd.Series(False, index=resultado.index)
+    seleccionada.loc[seleccionadas_idx] = True
+    return seleccionada
 
 
 def generate_link_proposals(
@@ -622,6 +703,7 @@ def generate_link_proposals(
             {
                 "score_minimo_usado": limites.score_minimo,
                 "max_enlaces_nuevos_por_origen_usado": limites.max_enlaces_nuevos_por_origen,
+                "max_enlaces_nuevos_por_destino_usado": limites.max_enlaces_nuevos_por_destino,
                 "pares_antes_de_filtros": 0,
                 "pares_tras_grupo_aislado": 0,
                 "pares_tras_salud_destino": 0,
@@ -754,8 +836,11 @@ def generate_link_proposals(
                     bloque_max if actual_max is None else max(actual_max, bloque_max)
                 )
         pairs = _recortar_bloque_a_lo_relevante(pairs, limites)
-        if contador is not None:
-            contador["pares_seleccionados"] += int(pairs["seleccionada"].sum())
+        # OJO: aquí NO se cuenta todavía "pares_seleccionados" -- la marca
+        # `seleccionada` de este punto es solo provisional (ver docstring
+        # de `_recortar_bloque_a_lo_relevante`); el recuento de verdad se
+        # hace más abajo, una vez calculada la selección final con
+        # presupuesto de destino sobre la tabla completa.
         if pairs.empty:
             continue
         bloques_resultado.append(pairs)
@@ -772,15 +857,9 @@ def generate_link_proposals(
         }
     )
 
-    resultado["seleccionada"] = False
-    validas = resultado[~resultado["pendiente_confirmar"]].copy()
-    validas = validas[validas["score"] >= limites.score_minimo]
-    validas = validas.sort_values(
-        ["categoria_origen", "score"], ascending=[True, False]
-    )
-    validas["_orden"] = validas.groupby("categoria_origen").cumcount()
-    seleccionadas_idx = validas[validas["_orden"] < limites.max_enlaces_nuevos_por_origen].index
-    resultado.loc[seleccionadas_idx, "seleccionada"] = True
+    resultado["seleccionada"] = _seleccionar_con_presupuesto_destino(resultado, limites)
+    if contador is not None:
+        contador["pares_seleccionados"] = int(resultado["seleccionada"].sum())
 
     resultado = resultado.rename(
         columns={

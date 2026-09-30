@@ -121,6 +121,16 @@ class OportunidadSEO:
 class LimitesPropuesta:
     max_enlaces_nuevos_por_origen: int = 5
     score_minimo: float = 0.0
+    # Presupuesto de enlaces ENTRANTES NUEVOS (los que propone esta misma
+    # ejecución, no cuenta los que ya tuviera de antes) que puede acumular
+    # una única categoría destino. Sin este tope, las categorías con mejor
+    # pinta "a priori" (más volumen, pocos productos, pocos enlaces
+    # entrantes de partida...) ganan la comparación una y otra vez frente a
+    # CUALQUIER origen, así que unas pocas categorías se llevan la mayoría
+    # de los enlaces nuevos mientras el resto del catálogo se queda sin
+    # ninguno — justo el problema de "enlazado repetitivo, poco repartido"
+    # que el script anterior evitaba con su cuota "En. Obj." por destino.
+    max_enlaces_nuevos_por_destino: int = 8
 
 
 @dataclass
