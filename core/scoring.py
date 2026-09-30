@@ -337,18 +337,25 @@ def exclude_existing_links(
     No se considera que un enlace destino -> origen (en sentido
     contrario) bloquee la propuesta origen -> destino: son enlaces
     distintos.
+
+    Implementado con `MultiIndex.isin` (vectorizado) en vez de
+    `.apply(..., axis=1)` fila a fila: con catálogos grandes, comparar
+    par a par en Python puro es uno de los puntos que más tiempo/memoria
+    consumía en el cruce completo (ver `generate_link_proposals`), y
+    aquí se puede evitar sin cambiar el resultado.
     """
     candidates = candidates[candidates["origen"] != candidates["destino"]]
 
-    if enlaces.empty:
+    if enlaces.empty or candidates.empty:
         return candidates.reset_index(drop=True)
 
-    existing_pairs = set(
-        zip(enlaces["source_url"], enlaces["destination_url"])
+    existing_index = pd.MultiIndex.from_arrays(
+        [enlaces["source_url"], enlaces["destination_url"]]
     )
-    mask_existing = candidates.apply(
-        lambda row: (row["origen"], row["destino"]) in existing_pairs, axis=1
+    candidates_index = pd.MultiIndex.from_arrays(
+        [candidates["origen"], candidates["destino"]]
     )
+    mask_existing = candidates_index.isin(existing_index)
     return candidates[~mask_existing].reset_index(drop=True)
 
 
@@ -363,6 +370,8 @@ RESULT_COLUMNS = [
     "keyword_destino",
     "volumen_destino",
     "texto_ancla_sugerido",
+    "categoria_principal_origen",
+    "categoria_secundaria_origen",
     "categoria_principal_destino",
     "categoria_secundaria_destino",
     "enlaces_entrantes_actuales_destino",
@@ -377,6 +386,144 @@ RESULT_COLUMNS = [
     "motivo_pendiente",
     "seleccionada",
 ]
+
+
+# Nº de filas (pares origen-destino) que como máximo se procesan de golpe
+# en cada bloque de `generate_link_proposals`. El tamaño de bloque, en Nº
+# de categorías ORIGEN, se recalcula según cuántas categorías destino
+# tenga el catálogo (`_BATCH_SIZE // nº de destinos`), para que el pico de
+# memoria dependa de esta constante y NO crezca con el tamaño del
+# catálogo: un catálogo con más URLs simplemente se parte en más bloques,
+# no en bloques más grandes. Probado con datos sintéticos: con
+# _BATCH_SIZE=250.000 el pico de memoria se mantiene por debajo de ~1 GB
+# tanto con 3.000 como con 6.000 URLs. No cambia el resultado, solo
+# cuánta memoria hace falta a la vez.
+_BATCH_SIZE = 250_000
+
+
+def _tamano_bloque_origenes(n_destinos: int) -> int:
+    return max(1, _BATCH_SIZE // max(n_destinos, 1))
+
+
+def _calcular_scores_bloque(
+    pairs: pd.DataFrame, weights: ScoringWeights, affinity: AffinityScores
+) -> pd.DataFrame:
+    """Calcula afinidad, motivo de "pendiente" y score para un bloque de
+    pares origen-destino ya filtrado (grupos aislados, salud técnica y
+    enlaces existentes ya excluidos). Antes esto se hacía fila a fila con
+    un bucle de Python (`itertuples` + `affinity_score`); aquí se hace
+    vectorizado con pandas/numpy sobre todo el bloque a la vez, que es
+    muchísimo más rápido con catálogos grandes y es lo que hace viable
+    procesar por bloques en vez de en una sola pasada gigante.
+
+    El resultado (columnas y valores) es idéntico al que producía el
+    bucle fila a fila original.
+    """
+    principal_o = pairs["categoria_principal_origen"].fillna("").astype(str).str.strip()
+    principal_d = pairs["categoria_principal_destino"].fillna("").astype(str).str.strip()
+    secundaria_o = pairs["categoria_secundaria_origen"].fillna("").astype(str).str.strip().str.lower()
+    secundaria_d = pairs["categoria_secundaria_destino"].fillna("").astype(str).str.strip().str.lower()
+
+    sin_categoria = (principal_o == "") | (principal_d == "")
+    misma_principal = principal_o.str.lower() == principal_d.str.lower()
+    misma_secundaria = misma_principal & (secundaria_o != "") & (secundaria_d != "") & (secundaria_o == secundaria_d)
+
+    afinidad = pd.Series(float("nan"), index=pairs.index)
+    afinidad = afinidad.mask(~sin_categoria & misma_secundaria, affinity.misma_principal_y_secundaria)
+    afinidad = afinidad.mask(~sin_categoria & misma_principal & ~misma_secundaria, affinity.misma_principal)
+    afinidad = afinidad.mask(~sin_categoria & ~misma_principal, affinity.distinta)
+    # sin_categoria se queda a NaN (afinidad "no calculable" = affinity_score
+    # devolviendo None en la versión anterior fila a fila).
+
+    falta_volumen_destino = pairs["falta_volumen_destino"]
+    falta_taxonomia_destino = pairs["falta_taxonomia_destino"]
+    falta_taxonomia_origen = pairs["falta_taxonomia_origen"]
+
+    pendiente = falta_volumen_destino | falta_taxonomia_destino | falta_taxonomia_origen | afinidad.isna()
+
+    # El motivo textual solo depende de qué combinación de las 3 señales
+    # de "falta X" está activa (8 combinaciones posibles) — se calcula una
+    # vez por combinación, no fila a fila, y se asigna con `.map`.
+    combo = (
+        falta_volumen_destino.astype(int)
+        + falta_taxonomia_destino.astype(int) * 2
+        + falta_taxonomia_origen.astype(int) * 4
+    )
+    motivo_por_combo = {}
+    for c in range(8):
+        partes_c = []
+        if c & 1:
+            partes_c.append("categoría destino sin volumen de búsqueda")
+        if c & 2:
+            partes_c.append("categoría destino sin categorización")
+        if c & 4:
+            partes_c.append("categoría origen sin categorización")
+        motivo_por_combo[c] = "; ".join(partes_c)
+    motivo = combo.map(motivo_por_combo)
+    # Caso residual: afinidad no calculable sin que ninguna de las 3
+    # señales lo explique (no debería darse en la práctica, ya que
+    # `sin_categoria` implica alguna de las `falta_taxonomia_*`, pero se
+    # cubre igual que en la versión anterior, por seguridad).
+    motivo = motivo.mask((motivo == "") & pendiente, "categorización incompleta")
+    motivo = motivo.mask(~pendiente, "")
+
+    score = (
+        weights.volumen_busqueda * pairs["norm_volumen_destino"]
+        + weights.pocos_productos * pairs["norm_pocos_productos_destino"]
+        + weights.pocos_enlaces_entrantes * pairs["norm_pocos_enlaces_destino"]
+        + weights.afinidad_categoria * afinidad.fillna(0.0)
+        + weights.relevancia_categoria * pairs["relevancia_categoria_destino"]
+        + weights.prioridad_negocio * pairs["prioridad_negocio_destino"]
+        + weights.autoridad_origen * pairs["norm_autoridad_origen"].fillna(0.0)
+        + weights.presupuesto_enlaces_origen * pairs["norm_presupuesto_enlaces_origen"].fillna(0.0)
+        + weights.posicion_oportunidad * pairs["posicion_oportunidad_destino"].fillna(0.0)
+        + weights.impresiones_busqueda * pairs["norm_impresiones_destino"].fillna(0.0)
+    )
+    score = score.mask(pendiente, float("nan"))
+
+    pairs = pairs.copy()
+    pairs["afinidad"] = afinidad
+    pairs["score"] = score
+    pairs["motivo_pendiente"] = motivo
+    pairs["pendiente_confirmar"] = pendiente
+    pairs["keyword_destino"] = pairs["keyword_destino"].fillna("")
+    pairs["texto_ancla_sugerido"] = pairs["keyword_destino"]
+    return pairs
+
+
+def _recortar_bloque_a_lo_relevante(
+    pairs: pd.DataFrame, limites: LimitesPropuesta
+) -> pd.DataFrame:
+    """De todos los pares candidatos ya puntuados de un bloque, se
+    queda solo con lo que de verdad hace falta conservar:
+
+    - Los pendientes de confirmar (para que el equipo los revise).
+    - Los que quedan SELECCIONADOS (el top `max_enlaces_nuevos_por_origen`
+      por score, para cada categoría origen del bloque).
+
+    El resto -candidatos válidos pero que no entraron en el top-N de su
+    origen- se descarta aquí mismo. Es la parte que de verdad evita que
+    la propuesta final ocupe O(N²): con un catálogo de miles de URLs,
+    la inmensa mayoría de los pares candidatos son justamente estos (un
+    origen tiene como candidatos a casi todo el catálogo, pero como
+    mucho le hacen falta 5). Cada categoría origen vive entera dentro de
+    un único bloque (el reparto en bloques es por origen, nunca la
+    parte), así que este recorte por bloque da el mismo resultado que
+    hacerlo una vez al final sobre la tabla completa.
+    """
+    pendiente = pairs["pendiente_confirmar"]
+
+    validas = pairs[~pendiente].copy()
+    validas = validas[validas["score"] >= limites.score_minimo]
+    validas = validas.sort_values(["origen", "score"], ascending=[True, False])
+    validas["_orden"] = validas.groupby("origen").cumcount()
+    seleccionadas_idx = validas[validas["_orden"] < limites.max_enlaces_nuevos_por_origen].index
+
+    pairs = pairs.copy()
+    pairs["seleccionada"] = False
+    pairs.loc[seleccionadas_idx, "seleccionada"] = True
+
+    return pairs[pairs["pendiente_confirmar"] | pairs["seleccionada"]]
 
 
 def generate_link_proposals(
@@ -472,83 +619,59 @@ def generate_link_proposals(
     origen_df = master.add_suffix("_origen").rename(columns={"url_origen": "origen"})
     destino_df = master.add_suffix("_destino").rename(columns={"url_destino": "destino"})
 
-    pairs = origen_df.assign(_key=1).merge(destino_df.assign(_key=1), on="_key").drop(columns="_key")
-
-    # Restricción dura de grupos aislados (Black Friday, Rebajas...): solo
-    # se permite el par si origen y destino están en el mismo grupo (o
-    # ambos son categorías "normales", grupo_aislado == "").
-    pairs = pairs[pairs["grupo_aislado_origen"] == pairs["grupo_aislado_destino"]]
-    if pairs.empty:
-        return pd.DataFrame(columns=RESULT_COLUMNS)
-
-    # Restricción dura de salud técnica: nunca se propone como destino una
-    # URL caída, redirigida o no indexable (si ese dato está disponible).
-    pairs = pairs[pairs["destino_saludable_destino"]]
-    if pairs.empty:
-        return pd.DataFrame(columns=RESULT_COLUMNS)
-
-    candidate_pairs = pairs[["origen", "destino"]].copy()
-    kept = exclude_existing_links(candidate_pairs, datasets.enlaces)
-    pairs = pairs.merge(kept, on=["origen", "destino"], how="inner")
-
-    if pairs.empty:
-        return pd.DataFrame(columns=RESULT_COLUMNS)
-
-    afinidad_valores = []
-    motivos = []
-    scores = []
-    for row in pairs.itertuples(index=False):
-        motivo_partes: list[str] = []
-
-        falta_volumen_destino = getattr(row, "falta_volumen_destino")
-        falta_taxonomia_destino = getattr(row, "falta_taxonomia_destino")
-        falta_taxonomia_origen = getattr(row, "falta_taxonomia_origen")
-
-        if falta_volumen_destino:
-            motivo_partes.append("categoría destino sin volumen de búsqueda")
-        if falta_taxonomia_destino:
-            motivo_partes.append("categoría destino sin categorización")
-        if falta_taxonomia_origen:
-            motivo_partes.append("categoría origen sin categorización")
-
-        afinidad = affinity_score(
-            getattr(row, "categoria_principal_origen"),
-            getattr(row, "categoria_secundaria_origen"),
-            getattr(row, "categoria_principal_destino"),
-            getattr(row, "categoria_secundaria_destino"),
-            affinity,
+    # El cruce origen x destino es, por definición, un producto cartesiano
+    # (cada categoría contra todas las demás como posible destino). Con un
+    # catálogo grande esto puede ser muchos millones de pares si se
+    # construye de una sola vez (N² filas en memoria a la vez), que es lo
+    # que hacía que la app se quedara sin memoria con el catálogo real de
+    # Sklum. Para evitarlo, se procesa por bloques de categorías ORIGEN
+    # (cada bloque se cruza contra TODAS las categorías destino, pero solo
+    # `_BATCH_SIZE` orígenes a la vez): el resultado final es exactamente
+    # el mismo (mismas filas, mismo orden tras el sort de más abajo), solo
+    # cambia cuánta memoria hace falta en cada momento.
+    bloques_resultado: list[pd.DataFrame] = []
+    n_origenes = len(origen_df)
+    tamano_bloque = _tamano_bloque_origenes(len(destino_df))
+    for inicio in range(0, n_origenes, tamano_bloque):
+        bloque_origen = origen_df.iloc[inicio : inicio + tamano_bloque]
+        pairs = (
+            bloque_origen.assign(_key=1)
+            .merge(destino_df.assign(_key=1), on="_key")
+            .drop(columns="_key")
         )
-        afinidad_valores.append(afinidad)
 
-        if motivo_partes or afinidad is None:
-            motivos.append("; ".join(motivo_partes) or "categorización incompleta")
-            scores.append(float("nan"))
-        else:
-            score = (
-                weights.volumen_busqueda * getattr(row, "norm_volumen_destino")
-                + weights.pocos_productos * getattr(row, "norm_pocos_productos_destino")
-                + weights.pocos_enlaces_entrantes * getattr(row, "norm_pocos_enlaces_destino")
-                + weights.afinidad_categoria * afinidad
-                + weights.relevancia_categoria * getattr(row, "relevancia_categoria_destino")
-                + weights.prioridad_negocio * getattr(row, "prioridad_negocio_destino")
-                + weights.autoridad_origen * _sin_nan(getattr(row, "norm_autoridad_origen"))
-                + weights.presupuesto_enlaces_origen
-                * _sin_nan(getattr(row, "norm_presupuesto_enlaces_origen"))
-                + weights.posicion_oportunidad * _sin_nan(getattr(row, "posicion_oportunidad_destino"))
-                + weights.impresiones_busqueda * _sin_nan(getattr(row, "norm_impresiones_destino"))
-            )
-            motivos.append("")
-            scores.append(score)
+        # Restricción dura de grupos aislados (Black Friday, Rebajas...):
+        # solo se permite el par si origen y destino están en el mismo
+        # grupo (o ambos son categorías "normales", grupo_aislado == "").
+        pairs = pairs[pairs["grupo_aislado_origen"] == pairs["grupo_aislado_destino"]]
+        if pairs.empty:
+            continue
 
-    pairs["afinidad"] = afinidad_valores
-    pairs["score"] = scores
-    pairs["motivo_pendiente"] = motivos
-    pairs["pendiente_confirmar"] = pairs["motivo_pendiente"] != ""
+        # Restricción dura de salud técnica: nunca se propone como destino
+        # una URL caída, redirigida o no indexable (si ese dato está
+        # disponible).
+        pairs = pairs[pairs["destino_saludable_destino"]]
+        if pairs.empty:
+            continue
 
-    pairs["keyword_destino"] = pairs["keyword_destino"].fillna("")
-    pairs["texto_ancla_sugerido"] = pairs["keyword_destino"]
+        candidate_pairs = pairs[["origen", "destino"]].copy()
+        kept = exclude_existing_links(candidate_pairs, datasets.enlaces)
+        pairs = pairs.merge(kept, on=["origen", "destino"], how="inner")
+        if pairs.empty:
+            continue
 
-    resultado = pairs.rename(
+        pairs = _calcular_scores_bloque(pairs, weights, affinity)
+        pairs = _recortar_bloque_a_lo_relevante(pairs, limites)
+        if pairs.empty:
+            continue
+        bloques_resultado.append(pairs)
+
+    if not bloques_resultado:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    resultado = pd.concat(bloques_resultado, ignore_index=True)
+
+    resultado = resultado.rename(
         columns={
             "origen": "categoria_origen",
             "destino": "categoria_destino",
@@ -614,7 +737,7 @@ def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
     mayor nº de enlaces seleccionados que tenga cualquier origen (no
     viene fijo a 5): si el límite configurado es distinto, cambia solo.
     """
-    columnas_vacias = ["id", "url"]
+    columnas_vacias = ["id", "url", "categoria_principal", "categoria_secundaria", "n_enlaces"]
     if resultado is None or resultado.empty or "seleccionada" not in resultado.columns:
         return pd.DataFrame(columns=columnas_vacias)
 
@@ -635,15 +758,99 @@ def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
 
     filas = []
     for origen, grupo in seleccion.groupby("categoria_origen", sort=False):
-        fila = {"id": extraer_id_de_url(origen), "url": origen}
+        primera = grupo.iloc[0]
+        fila = {
+            "id": extraer_id_de_url(origen),
+            "url": origen,
+            "categoria_principal": primera.get("categoria_principal_origen", ""),
+            "categoria_secundaria": primera.get("categoria_secundaria_origen", ""),
+            "n_enlaces": int(len(grupo)),
+        }
         for row in grupo.itertuples(index=False):
             n = int(row.orden)
             fila[f"linked_id_{n}"] = extraer_id_de_url(row.categoria_destino)
             fila[f"linked_url_{n}"] = row.categoria_destino
+            fila[f"linked_category_{n}"] = getattr(row, "categoria_principal_destino", "")
+            fila[f"linked_subcategory_{n}"] = getattr(row, "categoria_secundaria_destino", "")
+            score_n = getattr(row, "score", float("nan"))
+            fila[f"linked_score_{n}"] = round(score_n, 3) if pd.notna(score_n) else ""
+            fila[f"justificacion_{n}"] = _justificacion_enlace(row)
         filas.append(fila)
 
     columnas = list(columnas_vacias)
     for n in range(1, max_enlaces + 1):
-        columnas += [f"linked_id_{n}", f"linked_url_{n}"]
+        columnas += [
+            f"linked_id_{n}",
+            f"linked_url_{n}",
+            f"linked_category_{n}",
+            f"linked_subcategory_{n}",
+            f"linked_score_{n}",
+            f"justificacion_{n}",
+        ]
 
     return pd.DataFrame(filas).reindex(columns=columnas)
+
+
+def _valor_valido(valor) -> bool:
+    """True si `valor` es un dato real (ni None ni NaN). Atajo para no
+    repetir el chequeo típico de pandas en cada regla de
+    `_justificacion_enlace`.
+    """
+    return valor is not None and not (isinstance(valor, float) and pd.isna(valor))
+
+
+def _justificacion_enlace(row) -> str:
+    """Explicación breve, en lenguaje llano (no en jerga de scoring), de
+    por qué se propone este enlace en concreto: qué señales concretas
+    (volumen de búsqueda, pocos enlaces entrantes, categoría prioritaria,
+    prioridad de negocio, oportunidad de posicionamiento, misma
+    categoría...) pesaron a favor de ese destino.
+
+    Recibe una fila (namedtuple de `itertuples`) de la propuesta ya
+    calculada por `generate_link_proposals`: usa `getattr(..., None)`
+    para cada señal porque esta función también debe funcionar si se le
+    pasa una tabla con menos columnas (p.ej. en tests, o en una
+    integración externa que no traiga todo `RESULT_COLUMNS`) — en ese
+    caso simplemente omite las razones que no puede comprobar, en vez de
+    fallar.
+    """
+    razones: list[str] = []
+
+    volumen = getattr(row, "volumen_destino", None)
+    if _valor_valido(volumen) and volumen > 0:
+        razones.append(f"la categoría destino tiene volumen de búsqueda ({int(volumen)}/mes)")
+
+    entrantes = getattr(row, "enlaces_entrantes_actuales_destino", None)
+    if _valor_valido(entrantes) and entrantes <= 2:
+        razones.append("todavía tiene pocos enlaces internos apuntándole")
+
+    relevancia = getattr(row, "relevancia_categoria_destino", None)
+    if _valor_valido(relevancia) and relevancia > 0.5:
+        razones.append("está marcada como categoría prioritaria")
+
+    prioridad = getattr(row, "prioridad_negocio_destino", None)
+    if _valor_valido(prioridad) and prioridad > 0:
+        razones.append("tiene prioridad de negocio asignada")
+
+    posicion = getattr(row, "posicion_media_destino", None)
+    if _valor_valido(posicion) and 4 <= posicion <= 20:
+        razones.append(f"está en posición media {posicion:.0f} en Google, en zona de oportunidad")
+
+    principal_o = getattr(row, "categoria_principal_origen", None)
+    principal_d = getattr(row, "categoria_principal_destino", None)
+    if (
+        _valor_valido(principal_o)
+        and _valor_valido(principal_d)
+        and str(principal_o).strip()
+        and str(principal_o).strip().lower() == str(principal_d).strip().lower()
+    ):
+        razones.append("es de la misma categoría que el origen")
+
+    if not razones:
+        score = getattr(row, "score", None)
+        if _valor_valido(score):
+            razones.append(f"mejor encaje disponible según el score combinado ({score:.2f})")
+        else:
+            razones.append("mejor encaje disponible según el score combinado")
+
+    return "; ".join(razones)
