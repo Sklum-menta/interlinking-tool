@@ -468,9 +468,11 @@ def test_extraer_id_de_url_toma_el_id_numerico_del_slug():
 def test_build_formato_ancho_una_fila_por_origen_con_enlaces_en_columnas():
     """Formato heredado del flujo anterior en Sheets: una fila por URL
     origen con su id, y los enlaces YA SELECCIONADOS (no todos los
-    candidatos) como pares linked_id_N/linked_url_N, ordenados de mayor
-    a menor score. El nº de pares de columnas se ajusta al mayor nº de
-    enlaces seleccionados que tenga cualquier origen, no viene fijo a 5.
+    candidatos) como pares linked_id_N/linked_url_N (+ categoría,
+    subcategoría, score y justificación de cada enlace), ordenados de
+    mayor a menor score. El nº de bloques de columnas se ajusta al mayor
+    nº de enlaces seleccionados que tenga cualquier origen, no viene fijo
+    a 5.
     """
     url_524 = "https://www.sklum.com/es/524-comprar-mobiliario"
     url_30227 = "https://www.sklum.com/es/30227-comprar-muebles-de-tv-blancos"
@@ -483,6 +485,12 @@ def test_build_formato_ancho_una_fila_por_origen_con_enlaces_en_columnas():
         {
             "categoria_origen": [url_524, url_524, url_526, url_524],
             "categoria_destino": [url_30227, url_18374, url_4695, url_no_seleccionada],
+            "categoria_principal_origen": ["Muebles", "Muebles", "Iluminación", "Muebles"],
+            "categoria_secundaria_origen": ["", "", "", ""],
+            "categoria_principal_destino": ["Muebles", "Salón", "Iluminación", "Muebles"],
+            "categoria_secundaria_destino": ["", "", "", ""],
+            "volumen_destino": [500, 200, 300, 100],
+            "enlaces_entrantes_actuales_destino": [1, 5, 0, 2],
             "score": [0.9, 0.8, 0.7, 0.95],
             "seleccionada": [True, True, True, False],
         }
@@ -493,27 +501,65 @@ def test_build_formato_ancho_una_fila_por_origen_con_enlaces_en_columnas():
     assert list(ancho.columns) == [
         "id",
         "url",
+        "categoria_principal",
+        "categoria_secundaria",
+        "n_enlaces",
         "linked_id_1",
         "linked_url_1",
+        "linked_category_1",
+        "linked_subcategory_1",
+        "linked_score_1",
+        "justificacion_1",
         "linked_id_2",
         "linked_url_2",
+        "linked_category_2",
+        "linked_subcategory_2",
+        "linked_score_2",
+        "justificacion_2",
     ]
 
     fila_524 = ancho[ancho["url"] == url_524].iloc[0]
     assert fila_524["id"] == "524"
+    assert fila_524["categoria_principal"] == "Muebles"
+    assert fila_524["n_enlaces"] == 2
     assert fila_524["linked_id_1"] == "30227"
     assert fila_524["linked_url_1"] == url_30227
+    assert fila_524["linked_category_1"] == "Muebles"
+    assert fila_524["linked_score_1"] == 0.9
+    # Misma categoría (Muebles) + tiene volumen -> ambas razones deben
+    # aparecer en la justificación, en lenguaje llano.
+    assert "misma categoría" in fila_524["justificacion_1"]
+    assert "volumen de búsqueda" in fila_524["justificacion_1"]
     assert fila_524["linked_id_2"] == "18374"
     assert fila_524["linked_url_2"] == url_18374
 
     fila_526 = ancho[ancho["url"] == url_526].iloc[0]
     assert fila_526["id"] == "526"
+    assert fila_526["n_enlaces"] == 1
     assert fila_526["linked_id_1"] == "4695"
     # Solo tiene 1 enlace seleccionado -> la 2ª columna queda vacía (NaN).
     assert pd.isna(fila_526["linked_id_2"])
     # La propuesta descartada (seleccionada=False) no debe aparecer en
     # ninguna columna, ni siquiera de otro origen.
     assert url_no_seleccionada not in ancho.filter(like="linked_url").values
+
+
+def test_justificacion_cae_a_un_mensaje_generico_si_no_hay_ninguna_senal_disponible():
+    """Si `resultado` no trae ninguna de las columnas informativas (p.ej.
+    una integración externa que solo pase categoria_origen/destino +
+    score), la justificación no debe fallar: debe caer a un mensaje
+    genérico basado en el score.
+    """
+    resultado = pd.DataFrame(
+        {
+            "categoria_origen": ["https://www.sklum.com/es/1-a"],
+            "categoria_destino": ["https://www.sklum.com/es/2-b"],
+            "score": [0.42],
+            "seleccionada": [True],
+        }
+    )
+    ancho = build_formato_ancho(resultado)
+    assert "0.42" in ancho.iloc[0]["justificacion_1"]
 
 
 def test_build_formato_ancho_sin_seleccionadas_devuelve_tabla_vacia():
@@ -527,4 +573,37 @@ def test_build_formato_ancho_sin_seleccionadas_devuelve_tabla_vacia():
     )
     ancho = build_formato_ancho(resultado)
     assert ancho.empty
-    assert list(ancho.columns) == ["id", "url"]
+    assert list(ancho.columns) == [
+        "id",
+        "url",
+        "categoria_principal",
+        "categoria_secundaria",
+        "n_enlaces",
+    ]
+
+
+def test_generate_link_proposals_no_cambia_al_procesar_por_bloques_pequenos():
+    """`generate_link_proposals` cruza el catálogo por bloques de
+    categorías origen (`core.scoring._BATCH_SIZE`, un nº de filas
+    objetivo por bloque) para no construir todo el producto cartesiano en
+    memoria de golpe con catálogos grandes. El resultado no debe depender
+    del tamaño de bloque: aquí se fuerza un tamaño de bloque minúsculo (1
+    categoría origen por bloque, más bloques que URLs) y se compara con
+    el resultado "normal" para un dataset con más de un origen.
+    """
+    import core.scoring as scoring_module
+
+    datasets = _make_datasets()  # a, b, c (con volumen), d (pendiente)
+
+    original = generate_link_proposals(datasets)
+
+    valor_original = scoring_module._BATCH_SIZE
+    try:
+        scoring_module._BATCH_SIZE = 1  # fuerza 1 categoría origen por bloque
+        con_bloques_de_1 = generate_link_proposals(datasets)
+    finally:
+        scoring_module._BATCH_SIZE = valor_original
+
+    pd.testing.assert_frame_equal(
+        original.reset_index(drop=True), con_bloques_de_1.reset_index(drop=True)
+    )
