@@ -192,18 +192,18 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             "Peso: volumen de búsqueda",
             0.0,
             1.0,
-            0.40,
+            0.30,
             0.05,
             help="Más alto → prioriza enlazar categorías cuya keyword principal tiene más búsquedas mensuales.",
         )
     with c2:
         w_productos = st.slider(
-            "Peso: pocos productos",
+            "Peso: muchos productos",
             0.0,
             1.0,
-            0.20,
+            0.10,
             0.05,
-            help="Más alto → prioriza categorías con pocos productos (les cuesta más posicionar por sí solas).",
+            help="Más alto → prioriza categorías con MÁS productos (más catálogo, más recorrido de venta). Decisión de negocio del 30 sept: antes era al revés (se priorizaban las de pocos productos); ahora interesa reforzar con enlaces internos a las categorías con más catálogo.",
         )
     with c3:
         w_enlaces = st.slider(
@@ -212,21 +212,22 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             1.0,
             0.20,
             0.05,
-            help="Más alto → prioriza categorías que hoy reciben pocos enlaces internos (reparte mejor el 'link juice').",
+            help="Más alto → prioriza categorías que hoy reciben pocos enlaces internos y necesitan un empujón (reparte mejor el 'link juice').",
         )
     with c4:
         w_afinidad = st.slider(
             "Peso: afinidad de categoría",
             0.0,
             1.0,
-            0.20,
+            0.15,
             0.05,
             help="Más alto → prioriza enlazar entre categorías relacionadas (misma categoría principal/secundaria) frente a categorías sin relación.",
         )
 
     st.caption(
-        "Los 4 pesos de arriba se normalizan automáticamente para que sumen 100%, "
-        "así que puedes moverlos libremente sin hacer cuentas."
+        "Todos los pesos de esta sección (incluidos los de 'Página origen' y "
+        "'Search Console' más abajo) se normalizan automáticamente en conjunto "
+        "para que sumen 100%, así que puedes moverlos libremente sin hacer cuentas."
     )
 
     st.markdown(
@@ -287,7 +288,7 @@ with st.expander("Pesos del scoring y límites", expanded=True):
         max_value=50,
         value=8,
         help=(
-            "Evita que unas pocas categorías 'ganadoras' (mucho volumen, pocos "
+            "Evita que unas pocas categorías 'ganadoras' (mucho volumen, muchos "
             "productos, pocos enlaces entrantes de partida...) se lleven la "
             "mayoría de los enlaces nuevos mientras el resto del catálogo se "
             "queda sin ninguno. Con este límite, cuando una categoría destino "
@@ -299,7 +300,11 @@ with st.expander("Pesos del scoring y límites", expanded=True):
     )
 
     st.markdown(
-        "**Página origen** (0.0 = no afectan; miran a la categoría que enlaza, no a la que recibe el enlace)"
+        "**Página origen** (miran a la categoría que enlaza, no a la que recibe el enlace). "
+        "'Autoridad del origen' viene activada por defecto — decisión de negocio del 30 sept: "
+        "que sean las categorías ya bien posicionadas/con más autoridad interna las que enlacen "
+        "hacia las que necesitan el empujón, y no al revés. 'Presupuesto de enlaces del origen' "
+        "sigue en 0.0 (opcional) hasta que se active explícitamente."
     )
     c12, c13 = st.columns(2)
     with c12:
@@ -307,9 +312,9 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             "Peso: autoridad del origen",
             0.0,
             1.0,
-            0.0,
+            0.15,
             0.05,
-            help="Más alto → prioriza enlazar desde categorías que ya reciben muchos enlaces internos propios (transmiten más valor al enlazar).",
+            help="Más alto → prioriza enlazar desde categorías que ya reciben muchos enlaces internos propios (transmiten más valor al enlazar hacia categorías con oportunidad).",
         )
     with c13:
         w_presupuesto_origen = st.slider(
@@ -322,9 +327,12 @@ with st.expander("Pesos del scoring y límites", expanded=True):
         )
 
     st.markdown(
-        "**Search Console — oportunidad SEO** (0.0 = no afectan; requieren subir el "
-        "dataset de Search Console más arriba; si no se sube, estos pesos no tienen "
-        "ningún efecto aunque estén por encima de 0)"
+        "**Search Console — oportunidad SEO** (requieren subir el dataset de Search "
+        "Console más arriba; si no se sube, estos pesos no tienen ningún efecto aunque "
+        "estén por encima de 0). 'Posición en zona de oportunidad' viene activada por "
+        "defecto — decisión de negocio del 30 sept: enlazar hacia las categorías con "
+        "volumen alto de búsquedas que todavía no acaban de posicionar, para darles el "
+        "empujón que necesitan."
     )
     c14, c15 = st.columns(2)
     with c14:
@@ -332,9 +340,9 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             "Peso: posición en zona de oportunidad",
             0.0,
             1.0,
-            0.0,
+            0.10,
             0.05,
-            help="Más alto → prioriza categorías destino cuya posición media en Google está dentro del rango configurado abajo (candidatas a subir a primera página).",
+            help="Más alto → prioriza categorías destino cuya posición media en Google está dentro del rango configurado abajo (candidatas a subir a primera página con un empujón de enlaces internos).",
         )
     with c15:
         w_impresiones = st.slider(
@@ -396,7 +404,7 @@ with st.expander("Pesos del scoring y límites", expanded=True):
 
 weights = ScoringWeights(
     volumen_busqueda=w_volumen,
-    pocos_productos=w_productos,
+    muchos_productos=w_productos,
     pocos_enlaces_entrantes=w_enlaces,
     afinidad_categoria=w_afinidad,
     relevancia_categoria=w_relevancia,
