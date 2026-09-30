@@ -706,6 +706,133 @@ def generate_link_proposals(
 
 
 # ---------------------------------------------------------------------------
+# 4.1) Diagnóstico: por qué la propuesta ha salido vacía (o casi vacía)
+# ---------------------------------------------------------------------------
+#
+# `generate_link_proposals` siempre puede devolver 0 filas si los datos de
+# entrada no encajan entre sí (aunque la carga de cada fichero por
+# separado no haya dado ningún error), y en ese caso el motivo real puede
+# estar en cualquiera de varios sitios: URLs que no cruzan entre datasets,
+# una columna de salud técnica (Status_Code/Indexable) mal detectada que
+# excluye TODAS las URLs como destino, o una taxonomía que no se ha
+# reconocido bien. Esta función recalcula (de forma barata, sin el cruce
+# N² completo) los números clave de cada paso para poder señalar la causa
+# más probable sin tener que examinar el fichero original a mano.
+
+
+def diagnosticar_datasets(
+    datasets: InputDatasets,
+    relevancia_categoria: pd.DataFrame | None = None,
+    prioridad_negocio: pd.DataFrame | None = None,
+    grupos_aislados: list[str] | None = None,
+    search_console: pd.DataFrame | None = None,
+) -> dict:
+    """Devuelve un dict con estadísticas de diagnóstico sobre los 4
+    datasets de entrada, pensado para mostrarse en la interfaz cuando
+    `generate_link_proposals` devuelve una propuesta vacía. Nunca lanza
+    una excepción por sí misma.
+    """
+    diagnostico: dict = {
+        "n_crawl": int(len(datasets.crawl)),
+        "n_volumen": int(len(datasets.volumen)),
+        "n_taxonomia": int(len(datasets.taxonomia)),
+        "n_enlaces": int(len(datasets.enlaces)),
+    }
+
+    urls_crawl = set(datasets.crawl["url"]) if not datasets.crawl.empty else set()
+    urls_volumen = set(datasets.volumen["url"]) if not datasets.volumen.empty else set()
+    urls_taxonomia = set(datasets.taxonomia["url"]) if not datasets.taxonomia.empty else set()
+
+    diagnostico["urls_crawl_con_volumen"] = len(urls_crawl & urls_volumen)
+    diagnostico["urls_crawl_con_taxonomia"] = len(urls_crawl & urls_taxonomia)
+    diagnostico["ejemplo_urls_crawl"] = sorted(urls_crawl)[:5]
+    diagnostico["ejemplo_urls_volumen"] = sorted(urls_volumen)[:5]
+    diagnostico["ejemplo_urls_taxonomia"] = sorted(urls_taxonomia)[:5]
+    diagnostico["ejemplo_urls_crawl_sin_taxonomia"] = sorted(urls_crawl - urls_taxonomia)[:5]
+
+    if len(urls_crawl) < 2:
+        diagnostico["motivo_probable"] = (
+            "El dataset de crawl tiene menos de 2 URLs válidas tras la limpieza "
+            "(o ninguna). Revisa que la columna de URL del fichero no venga "
+            "vacía y que se haya reconocido bien (mira 'ejemplo_urls_crawl')."
+        )
+        return diagnostico
+
+    master = build_master_table(
+        datasets, relevancia_categoria, prioridad_negocio, grupos_aislados, search_console
+    )
+    diagnostico["n_master"] = int(len(master))
+
+    if "status_code" not in master.columns:
+        master["status_code"] = float("nan")
+    if "indexable" not in master.columns:
+        master["indexable"] = None
+
+    saludable = pd.Series(True, index=master.index)
+    saludable &= ~(master["status_code"].notna() & (master["status_code"] != 200))
+    saludable &= ~(master["indexable"] == False)  # noqa: E712
+    diagnostico["n_destino_saludable"] = int(saludable.sum())
+    diagnostico["n_destino_no_saludable"] = int((~saludable).sum())
+    if master["status_code"].notna().any():
+        diagnostico["distribucion_status_code"] = {
+            str(k): int(v) for k, v in master["status_code"].value_counts(dropna=False).items()
+        }
+    if master["indexable"].notna().any():
+        diagnostico["distribucion_indexable"] = {
+            str(k): int(v) for k, v in master["indexable"].value_counts(dropna=False).items()
+        }
+
+    patrones_grupo = list(grupos_aislados) if grupos_aislados is not None else list(DEFAULT_GRUPOS_AISLADOS)
+    grupo_aislado = master.apply(
+        lambda r: _detectar_grupo_aislado(r["categoria_principal"], r["categoria_secundaria"], patrones_grupo),
+        axis=1,
+    )
+    diagnostico["distribucion_grupo_aislado"] = {
+        (k if k else "(normal, sin grupo)"): int(v)
+        for k, v in grupo_aislado.value_counts(dropna=False).items()
+    }
+
+    n_categorias = int(
+        master["categoria_principal"].astype(str).str.strip().replace("", pd.NA).nunique(dropna=True)
+    )
+    diagnostico["n_categorias_principales_distintas"] = n_categorias
+
+    if diagnostico["n_destino_saludable"] < 2:
+        diagnostico["motivo_probable"] = (
+            "Prácticamente ninguna URL queda marcada como 'destino saludable' "
+            "(según las columnas Status_Code/Indexable): revisa esas dos "
+            "columnas en el fichero, es posible que se esté leyendo una "
+            "columna distinta a la esperada (mira 'distribucion_status_code' "
+            "y 'distribucion_indexable')."
+        )
+    elif n_categorias <= 1:
+        diagnostico["motivo_probable"] = (
+            "Todas las URLs comparten la misma categoría principal (o no se "
+            "les ha asignado ninguna): revisa la columna de "
+            "Categoria_Principal del fichero."
+        )
+    elif diagnostico["urls_crawl_con_taxonomia"] == 0:
+        diagnostico["motivo_probable"] = (
+            "Ninguna URL del crawl tiene taxonomía asociada: aunque estén en "
+            "el mismo fichero, puede que la columna de URL usada para "
+            "detectar el crawl no sea la misma que la usada para la "
+            "taxonomía (revisa 'ejemplo_urls_crawl' vs "
+            "'ejemplo_urls_taxonomia')."
+        )
+    else:
+        diagnostico["motivo_probable"] = (
+            "Los filtros básicos (salud técnica, categorías) no descartan "
+            "nada por sí solos: si aun así la propuesta sale vacía, el motivo "
+            "más probable es que todos los pares candidato ya tuvieran un "
+            "enlace existente entre sí (revisa el dataset de enlaces, "
+            "'n_enlaces' arriba) o que el score mínimo configurado sea "
+            "demasiado alto."
+        )
+
+    return diagnostico
+
+
+# ---------------------------------------------------------------------------
 # 5) Formato "ancho" (id + enlaces en columnas) para integraciones externas
 # ---------------------------------------------------------------------------
 
