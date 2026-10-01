@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
 
 from auth import require_login
 from core.config import AffinityScores, AppConfig, LimitesPropuesta, OportunidadSEO, ScoringWeights
@@ -27,10 +29,38 @@ from core.data_loader import (
 )
 from core.scoring import (
     build_formato_ancho,
+    build_formato_it,
     comparar_evolucion_search_console,
     diagnosticar_datasets,
     generate_link_proposals,
+    IT_SHOPS_DEFAULT,
 )
+
+def _estilizar_hoja_it(buffer: io.BytesIO) -> None:
+    """Da al Excel del "documento para IT" el mismo aspecto que ya tenía
+    el documento que se pasó a IT en marzo 2025 (cabecera en negrita con
+    fondo azul claro, fuente Arial, columnas anchas para que el SQL se
+    lea entero) para que el equipo lo reconozca de un vistazo como "el
+    mismo tipo de documento". Modifica `buffer` in-place (reescribe su
+    contenido tras re-guardar el workbook con el estilo aplicado).
+    """
+    buffer.seek(0)
+    wb = load_workbook(buffer)
+    ws = wb["Info a IT"]
+    cabecera_fill = PatternFill(start_color="FFCFE2F3", end_color="FFCFE2F3", fill_type="solid")
+    for cell in ws[1]:
+        cell.font = Font(name="Arial", bold=True)
+        cell.fill = cabecera_fill
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = Font(name="Arial")
+    anchos = {"A": 14, "B": 55, "C": 40, "D": 110}
+    for col, w in anchos.items():
+        ws.column_dimensions[col].width = w
+    buffer.seek(0)
+    buffer.truncate(0)
+    wb.save(buffer)
+
 
 st.set_page_config(
     page_title="Interlinking SEO — Sklum",
@@ -270,7 +300,18 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             min_value=1,
             max_value=50,
             value=5,
-            help="De todas las candidatas, cuántos enlaces nuevos (como máximo) se proponen desde cada categoría origen — los de mayor score.",
+            help=(
+                "De todas las candidatas, cuántos enlaces nuevos (como máximo) se "
+                "proponen desde cada categoría origen — los de mayor score. Esto es "
+                "lo normal; solo baja de este número en casos puntuales (cuando de "
+                "verdad no hay suficientes categorías afines), y la propuesta "
+                "siempre explica por qué (columna 'motivo_num_enlaces'). Además, "
+                "ninguna categoría con candidatas de sobra se queda nunca con un "
+                "único enlace: si el reparto por rondas la dejaría con menos de 3, "
+                "la herramienta le 'presta' un hueco cedido por otra categoría con "
+                "margen, de modo que el mínimo real sea siempre 3 (o este máximo, "
+                "si lo bajas por debajo de 3)."
+            ),
         )
     with c9:
         score_minimo = st.slider(
@@ -296,6 +337,31 @@ with st.expander("Pesos del scoring y límites", expanded=True):
             "proponerse como destino y el siguiente mejor candidato de cada "
             "origen ocupa su lugar — así los enlaces nuevos se reparten por "
             "más categorías en vez de repetirse siempre en las mismas."
+        ),
+    )
+    max_enlaces_excepcional = st.number_input(
+        "Techo EXCEPCIONAL de enlaces por categoría origen (casos justificados)",
+        min_value=int(max_enlaces),
+        max_value=50,
+        value=max(10, int(max_enlaces)),
+        help=(
+            "No es una norma general: la inmensa mayoría de categorías se queda "
+            "en el máximo de arriba. Solo unas pocas categorías EXCEPCIONALES "
+            "pueden llegar hasta este techo más alto, y solo si cumplen alguna de "
+            "estas condiciones (cada una con su propio filtro estadístico para que "
+            "siga siendo la excepción y no la norma):\n"
+            "- casi no tienen enlaces salientes propios todavía;\n"
+            "- están entre el 10% con más enlaces entrantes del catálogo "
+            "(autoridad interna);\n"
+            "- tienen mucho rendimiento REAL en Search Console (clics de los "
+            "últimos 28 días, entre el 10% con más tráfico) — si de verdad "
+            "reciben visitas, pueden repartir más enlaces sin diluir su "
+            "relevancia;\n"
+            "- (si el rastreo trae esa columna) están entre el 10% con menor "
+            "profundidad/nivel de rastreo, es decir, muy cerca de la home.\n"
+            "La propuesta final siempre explica el motivo concreto (columna "
+            "'motivo_num_enlaces') cuando una categoría recibe más enlaces de los "
+            "normales — nunca en silencio."
         ),
     )
 
@@ -389,9 +455,10 @@ with st.expander("Pesos del scoring y límites", expanded=True):
     )
     grupos_aislados_texto = st.text_area(
         "Un patrón adicional por línea (opcional; se busca como texto, sin distinguir "
-        "mayúsculas, en Categoria_Principal + Categoria_Secundaria de cada URL). "
-        "Black Friday/Rebajas/Special Price/Navidad no hace falta escribirlos: ya están "
-        "siempre aislados.",
+        "mayúsculas, primero en la URL y, si ahí no aparece, en Categoria_Principal + "
+        "Categoria_Secundaria de cada URL — la URL manda si no coinciden, porque es un "
+        "dato técnico que no se puede escribir mal a mano). Black Friday/Rebajas/"
+        "Special Price/Navidad no hace falta escribirlos: ya están siempre aislados.",
         value="",
         help=(
             "Ej. si quieres aislar también, por ejemplo, 'Outlet', escribe 'Outlet' aquí "
@@ -423,6 +490,7 @@ limites = LimitesPropuesta(
     max_enlaces_nuevos_por_origen=int(max_enlaces),
     score_minimo=score_minimo,
     max_enlaces_nuevos_por_destino=int(max_enlaces_destino),
+    max_enlaces_nuevos_por_origen_excepcional=int(max_enlaces_excepcional),
 )
 oportunidad = OportunidadSEO(posicion_min=posicion_min, posicion_max=posicion_max)
 
@@ -719,13 +787,27 @@ if resultado is not None and not resultado.empty:
 
     st.subheader("Descargar propuesta")
     st.caption(
-        "👉 Para compartir con el equipo o importar en Sheets, usa la de la "
-        "derecha (**formato id + enlaces**): una fila por categoría origen, "
-        "con categoría/subcategoría/score y una justificación de cada "
-        "enlace propuesto. Las otras dos son la tabla técnica completa "
-        "(un candidato por fila), útiles para depurar el scoring."
+        "👉 Para compartir con el equipo o importar en Sheets, usa "
+        "**formato id + enlaces**: una fila por categoría origen, con "
+        "categoría/subcategoría/score y una justificación de cada enlace "
+        "propuesto. **Documento para IT** es la versión rápida, lista "
+        "para ejecutar, con solo lo que necesita IT. Las otras dos son la "
+        "tabla técnica completa (un candidato por fila), útiles para "
+        "depurar el scoring."
     )
-    dcol1, dcol2, dcol3 = st.columns(3)
+    with st.expander("⚙️ Tiendas (id_shop) del documento para IT", expanded=False):
+        st.caption(
+            "Lista de `id_shop` de PrestaShop (multi-tienda: idiomas/países "
+            "de Sklum) que va en el WHERE de cada sentencia UPDATE. Por "
+            "defecto, la misma que llevaba el documento que se pasó a IT en "
+            "marzo 2025 — cámbiala solo si esa lista de tiendas ha cambiado."
+        )
+        shops_it = st.text_input(
+            "id_shop separados por coma",
+            value=IT_SHOPS_DEFAULT,
+            key="shops_it",
+        )
+    dcol1, dcol2, dcol3, dcol4 = st.columns(4)
     with dcol1:
         st.download_button(
             "⬇️ Descargar CSV (técnico)",
@@ -757,7 +839,34 @@ if resultado is not None and not resultado.empty:
                 "y los enlaces ya seleccionados: linked_id_1/linked_url_1/"
                 "linked_category_1/linked_subcategory_1/linked_score_1/"
                 "justificacion_1, linked_id_2/... (mismo formato que el "
-                "flujo anterior de Sheets, con la justificación añadida)."
+                "flujo anterior de Sheets, con la justificación añadida). "
+                "La columna 'motivo_num_enlaces' explica por qué una "
+                "categoría tiene más o menos enlaces de los normales, "
+                "cuando aplica."
+            ),
+        )
+    with dcol4:
+        formato_it = build_formato_it(resultado, shops=shops_it)
+        buffer_it = io.BytesIO()
+        with pd.ExcelWriter(buffer_it, engine="openpyxl") as writer:
+            formato_it.to_excel(writer, index=False, sheet_name="Info a IT")
+        _estilizar_hoja_it(buffer_it)
+        st.download_button(
+            "⬇️ Descargar documento para IT",
+            data=buffer_it.getvalue(),
+            file_name="interlinking_documento_IT.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=formato_it.empty,
+            help=(
+                "Mismo formato que el documento 'Info a IT' que se pasó a "
+                "IT en marzo 2025: ID CAT MAIN, URL, la lista de IDs "
+                "destino separados por coma, y la sentencia UPDATE ya "
+                "lista para ejecutar sobre `led_category_shop`. A "
+                "diferencia de marzo 2025, la lista de IDs no siempre "
+                "tiene 5 — refleja el nº real de enlaces seleccionados "
+                "para cada categoría (de 3 a los excepcionales). No "
+                "incluye enlaces manuales a páginas CMS (el rastreo no "
+                "las conoce)."
             ),
         )
 
