@@ -7,6 +7,10 @@ tenga exactamente estos nombres, basta con que sean reconocibles.
 
 1) Crawl / nº de productos — una fila por URL:
    URL, Nº_Productos
+   (opcionales: Status_Code, Indexable, Profundidad/Nivel/Crawl_Depth —
+   el nº de clics desde la home, si el rastreo lo trae — y H1/H1-1 — el
+   H1 real de la página; si no viene, se aproxima a partir del slug de
+   la URL)
 
 2) Enlaces existentes — se aceptan DOS formatos, autodetectados:
 
@@ -316,6 +320,62 @@ def _parse_num_productos(raw: pd.Series) -> pd.Series:
 STATUS_CODE_CANDIDATES = ["Status_Code", "Status Code", "Codigo_Estado", "HTTP_Status", "Codigo Estado"]
 INDEXABLE_CANDIDATES = ["Indexable", "Indexability", "Indexabilidad"]
 
+# Nivel de profundidad de rastreo (opcional): cuántos clics hacen falta
+# desde la home para llegar a esa URL, tal y como lo exporta Screaming
+# Frog ("Crawl Depth") u otras herramientas de rastreo ("Nivel",
+# "Level"...). No es obligatorio -si no viene, simplemente no se usa
+# para nada-, pero si está disponible se usa como una señal ESTRUCTURAL
+# de autoridad interna (cuanto más cerca de la home, más autoridad),
+# complementaria a los enlaces entrantes ya contados: ver
+# `core.scoring._elegibilidad_ampliacion_origen`.
+PROFUNDIDAD_CANDIDATES = [
+    "Profundidad",
+    "Nivel",
+    "Level",
+    "Crawl_Depth",
+    "Crawl Depth",
+    "Click_Depth",
+    "Click Depth",
+    "Depth",
+    "Profundidad_Rastreo",
+]
+
+
+def _parse_profundidad(raw: pd.Series) -> pd.Series:
+    """Convierte la columna de profundidad/nivel de rastreo a numérico.
+
+    Admite tanto una columna ya numérica (el caso normal al exportar desde
+    Screaming Frog) como texto con el número mezclado con palabras (p.ej.
+    "Nivel 3", "Depth: 2") extrayendo el primer número que aparezca.
+    """
+    if pd.api.types.is_numeric_dtype(raw):
+        return pd.to_numeric(raw, errors="coerce")
+    text = raw.astype(str).str.strip()
+    numero = text.str.extract(r"(\d+)")[0]
+    return pd.to_numeric(numero, errors="coerce")
+
+
+# H1 real de la página (opcional): si el rastreo lo trae (Screaming Frog lo
+# exporta de forma nativa como "H1-1"), se usa tal cual para que la
+# propuesta sea más fácil de revisar de un vistazo. Si no viene, NO se
+# inventa un dato aquí -se deja vacío y es `core.scoring.build_master_table`
+# quien rellena una aproximación a partir del slug de la URL, dejando
+# claro en el propio código que es solo un sustituto mientras el export no
+# incluya esta columna.
+H1_CANDIDATES = [
+    "H1",
+    "H1-1",
+    "H1_1",
+    "Título H1",
+    "Titulo H1",
+    "Heading 1",
+    "Title H1",
+]
+
+
+def _parse_h1(raw: pd.Series) -> pd.Series:
+    return raw.astype(str).str.strip().replace({"nan": ""})
+
 # Valores de la columna "Indexability" que exporta Screaming Frog de
 # forma nativa: solo "Indexable" cuenta como indexable; cualquier otro
 # valor ("Non-Indexable", "Canonicalised", "Redirected", "Blocked by
@@ -354,6 +414,10 @@ def _extract_crawl(df: pd.DataFrame) -> pd.DataFrame:
     )
     col_status = _find_column(df, STATUS_CODE_CANDIDATES, required=False, label="columna de status code")
     col_indexable = _find_column(df, INDEXABLE_CANDIDATES, required=False, label="columna de indexabilidad")
+    col_profundidad = _find_column(
+        df, PROFUNDIDAD_CANDIDATES, required=False, label="columna de profundidad/nivel"
+    )
+    col_h1 = _find_column(df, H1_CANDIDATES, required=False, label="columna de H1")
 
     out = pd.DataFrame(
         {
@@ -363,6 +427,10 @@ def _extract_crawl(df: pd.DataFrame) -> pd.DataFrame:
                 pd.to_numeric(df[col_status], errors="coerce") if col_status else float("nan")
             ),
             "indexable": _parse_indexable(df[col_indexable]) if col_indexable else None,
+            "profundidad": (
+                _parse_profundidad(df[col_profundidad]) if col_profundidad else float("nan")
+            ),
+            "h1": (_parse_h1(df[col_h1]) if col_h1 else ""),
         }
     )
     out = out[out["url"] != ""].drop_duplicates(subset="url", keep="first")
@@ -782,6 +850,10 @@ def load_plantilla_unificada(file) -> InputDatasets:
     - `Status_Code`, `Indexable` (opcionales — si el crawl las trae, se
       excluyen automáticamente como destino las URLs con status distinto
       de 200 o no indexables; ver `_parse_indexable`)
+    - `Profundidad` / `Nivel` / `Crawl_Depth` (opcional — el nº de clics
+      desde la home según el rastreo; si se aporta, se usa como señal
+      adicional de autoridad interna estructural, ver
+      `core.scoring._elegibilidad_ampliacion_origen`)
     - `Categoria_Principal`, `Categoria_Secundaria`
     - `Keyword_1`, `Volumen` (volumen de búsqueda de esa keyword)
     - `Enlace_Bolita_1`, `Enlace_Bolita_2`, ... (tantas columnas como
