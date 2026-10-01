@@ -1,2006 +1,2039 @@
+"""Lógica de negocio: cruce de datasets, scoring y generación de la
+propuesta de interlinking.
+
+Este módulo es intencionadamente independiente de Streamlit para poder
+testearlo con pytest de forma aislada (ver tests/test_scoring.py y
+tests/test_exclusion.py).
+"""
+from __future__ import annotations
+
+import re
+
 import pandas as pd
-import pytest
 
 from core.config import AffinityScores, LimitesPropuesta, OportunidadSEO, ScoringWeights
-from core.data_loader import InputDatasets
-from core.scoring import (
-    _derivar_titulo_desde_url,
-    _elegibilidad_ampliacion_origen,
-    _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA,
-    _rescatar_minimo_por_congestion,
-    affinity_score,
-    build_formato_ancho,
-    build_formato_it,
-    build_master_table,
-    comparar_evolucion_search_console,
-    diagnosticar_datasets,
-    extraer_id_de_url,
-    generate_link_proposals,
-    IT_SHOPS_DEFAULT,
-    oportunidad_posicion_score,
-)
-
-
-def _make_datasets() -> InputDatasets:
-    crawl = pd.DataFrame(
-        {
-            "url": ["a", "b", "c", "d"],
-            "num_productos": [100, 5, 50, 3],
-        }
-    )
-    volumen = pd.DataFrame(
-        {
-            "url": ["a", "b", "c"],  # "d" no tiene volumen -> pendiente
-            "keyword": ["kw_a", "kw_b", "kw_c"],
-            "volumen": [1000, 8000, 200],
-        }
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": ["a", "b", "c", "d"],
-            "categoria_principal": ["Muebles", "Muebles", "Iluminacion", "Muebles"],
-            "categoria_secundaria": ["Salon", "Salon", "Techo", "Dormitorio"],
-        }
-    )
-    enlaces = pd.DataFrame(
-        {
-            "source_url": ["a"],
-            "destination_url": ["c"],
-            "anchor_text": ["algo"],
-            "zona": ["Content"],
-        }
-    )
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-
-def test_affinity_score_prioriza_misma_categoria():
-    affinity = AffinityScores(misma_principal_y_secundaria=1.0, misma_principal=0.6, distinta=0.15)
-
-    assert affinity_score("Muebles", "Salon", "Muebles", "Salon", affinity) == 1.0
-    assert affinity_score("Muebles", "Salon", "Muebles", "Dormitorio", affinity) == 0.6
-    assert affinity_score("Muebles", "Salon", "Iluminacion", "Techo", affinity) == 0.15
-
-
-def test_affinity_score_devuelve_none_si_falta_categoria():
-    affinity = AffinityScores()
-    assert affinity_score(None, None, "Muebles", "Salon", affinity) is None
-    assert affinity_score("", "", "Muebles", "Salon", affinity) is None
-
-
-def test_build_master_table_marca_datos_faltantes():
-    datasets = _make_datasets()
-    master = build_master_table(datasets)
-
-    fila_d = master.set_index("url").loc["d"]
-    assert fila_d["falta_volumen"] is True or fila_d["falta_volumen"] == True  # noqa: E712
-    assert fila_d["falta_taxonomia"] == False  # noqa: E712
-
-    # "c" recibe un enlace entrante desde "a"
-    fila_c = master.set_index("url").loc["c"]
-    assert fila_c["enlaces_entrantes_actuales"] == 1
-
-
-def test_generate_link_proposals_marca_pendientes_por_falta_de_volumen():
-    datasets = _make_datasets()
-    resultado = generate_link_proposals(datasets)
-
-    hacia_d = resultado[resultado["categoria_destino"] == "d"]
-    assert not hacia_d.empty
-    assert hacia_d["pendiente_confirmar"].all()
-    assert hacia_d["score"].isna().all()
-    # Una fila pendiente nunca se marca como seleccionada automáticamente.
-    assert not hacia_d["seleccionada"].any()
-
-
-def test_generate_link_proposals_prioriza_mayor_volumen_y_afinidad():
-    datasets = _make_datasets()
-    weights = ScoringWeights(
-        volumen_busqueda=1.0, muchos_productos=0.0, pocos_enlaces_entrantes=0.0, afinidad_categoria=0.0
-    )
-    resultado = generate_link_proposals(datasets, weights=weights)
-
-    desde_c = resultado[
-        (resultado["categoria_origen"] == "c") & (~resultado["pendiente_confirmar"])
-    ].sort_values("score", ascending=False)
-
-    # Con peso 100% en volumen, "b" (volumen 8000) debe ir antes que "a" (volumen 1000)
-    orden_destinos = desde_c["categoria_destino"].tolist()
-    assert orden_destinos.index("b") < orden_destinos.index("a")
-
-
-def test_muchos_productos_prioriza_categorias_destino_con_mas_productos():
-    """Decisión de negocio del 30 sept: cuantos MÁS productos tenga la
-    categoría destino, más prioridad (antes de esa fecha era al revés:
-    se priorizaban las categorías con pocos productos). Con peso 100%
-    en este criterio, "a" (100 productos) debe ir antes que "b" (5
-    productos), aunque "b" tenga más volumen de búsqueda.
-    """
-    datasets = _make_datasets()
-    weights = ScoringWeights(
-        volumen_busqueda=0.0, muchos_productos=1.0, pocos_enlaces_entrantes=0.0, afinidad_categoria=0.0
-    )
-    resultado = generate_link_proposals(datasets, weights=weights)
-
-    desde_c = resultado[
-        (resultado["categoria_origen"] == "c") & (~resultado["pendiente_confirmar"])
-    ].sort_values("score", ascending=False)
-
-    orden_destinos = desde_c["categoria_destino"].tolist()
-    assert orden_destinos.index("a") < orden_destinos.index("b")
-
-
-def test_pesos_por_defecto_activan_autoridad_origen_y_posicion_oportunidad():
-    """Decisión de negocio del 30 sept: por defecto (sin tocar nada en la
-    interfaz) ya se prioriza enlazar DESDE categorías con más autoridad
-    interna HACIA categorías con volumen alto que están en zona de
-    oportunidad de posición. Antes de esa fecha ambos pesos eran 0 por
-    defecto (solo se activaban a mano). Este test es un candado para que
-    nadie los vuelva a poner a 0 sin querer en un cambio futuro.
-    """
-    pesos = ScoringWeights()
-    assert pesos.autoridad_origen > 0
-    assert pesos.posicion_oportunidad > 0
-    assert pesos.muchos_productos > 0
-    # Siguen sumando 1 de partida (no es obligatorio, `normalizados()` lo
-    # arregla igualmente, pero así los sliders de la interfaz arrancan
-    # ya en 100% sin que el usuario tenga que hacer cuentas).
-    total = (
-        pesos.volumen_busqueda
-        + pesos.muchos_productos
-        + pesos.pocos_enlaces_entrantes
-        + pesos.afinidad_categoria
-        + pesos.relevancia_categoria
-        + pesos.prioridad_negocio
-        + pesos.autoridad_origen
-        + pesos.presupuesto_enlaces_origen
-        + pesos.posicion_oportunidad
-        + pesos.impresiones_busqueda
-    )
-    assert total == pytest.approx(1.0)
-
-
-def test_generate_link_proposals_respeta_limite_por_origen():
-    datasets = _make_datasets()
-    limites = LimitesPropuesta(max_enlaces_nuevos_por_origen=1, score_minimo=0.0)
-    resultado = generate_link_proposals(datasets, limites=limites)
-
-    for origen, grupo in resultado.groupby("categoria_origen"):
-        assert grupo["seleccionada"].sum() <= 1
-
-
-def _make_datasets_muchos_origenes_un_destino_popular() -> InputDatasets:
-    """8 categorías origen (o1..o8) que, sin límite de destino, elegirían
-    TODAS a "popular" como mejor candidata frente a "alternativa": tiene
-    10 veces más volumen de búsqueda (5000 vs 500), lo que domina el
-    score con los pesos por defecto aunque tenga menos productos que
-    "alternativa" (el nº de productos pesa mucho menos que el volumen).
-    Los orígenes o1..o8 no tienen volumen propio, así que nunca son
-    elegibles como destino entre ellos (quedan "pendiente_confirmar" si
-    se probasen como destino) y la única competencia real es entre
-    "popular" y "alternativa".
-    """
-    origenes = [f"o{i}" for i in range(1, 9)]
-    urls = origenes + ["popular", "alternativa"]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [50] * len(origenes) + [5, 10]})
-    volumen = pd.DataFrame(
-        {
-            "url": ["popular", "alternativa"],
-            "keyword": ["kw_popular", "kw_alternativa"],
-            "volumen": [5000, 500],
-        }
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": ["Salon"] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-
-def test_presupuesto_por_destino_reparte_enlaces_en_vez_de_concentrarlos():
-    """Regla de calidad confirmada por el usuario el 30 sept (comparando
-    con el script anterior, que limitaba enlaces entrantes nuevos por
-    categoría con su columna "En. Obj."): ninguna categoría destino debe
-    poder acumular enlaces nuevos sin límite solo por tener mejor pinta a
-    priori. Con `max_enlaces_nuevos_por_destino=3`, "popular" (la mejor
-    candidata para las 8 categorías origen) no puede recibir más de 3
-    enlaces nuevos, aunque las 8 la hubiesen elegido sin ese tope.
-    """
-    datasets = _make_datasets_muchos_origenes_un_destino_popular()
-    limites = LimitesPropuesta(
-        max_enlaces_nuevos_por_origen=1, max_enlaces_nuevos_por_destino=3, score_minimo=0.0
-    )
-    resultado = generate_link_proposals(datasets, limites=limites)
-    seleccionadas = resultado[resultado["seleccionada"]]
-
-    conteo_por_destino = seleccionadas["categoria_destino"].value_counts()
-    assert conteo_por_destino.get("popular", 0) <= 3
-    assert (conteo_por_destino <= 3).all()
-    # El resto de orígenes que no cupieron en "popular" deben repartirse
-    # hacia "alternativa" en vez de perderse todos silenciosamente.
-    assert "alternativa" in conteo_por_destino.index
-
-
-def test_presupuesto_por_destino_no_afecta_si_hay_hueco_de_sobra():
-    """Con un presupuesto por destino holgado (por encima del nº de
-    orígenes candidatos), el comportamiento es el mismo de siempre: la
-    categoría con mejor score se lleva todos los enlaces que le
-    correspondan sin que el nuevo límite le quite ninguno.
-    """
-    datasets = _make_datasets_muchos_origenes_un_destino_popular()
-    limites = LimitesPropuesta(
-        max_enlaces_nuevos_por_origen=1, max_enlaces_nuevos_por_destino=100, score_minimo=0.0
-    )
-    resultado = generate_link_proposals(datasets, limites=limites)
-    origenes_o = [f"o{i}" for i in range(1, 9)]
-    seleccionadas_desde_o = resultado[
-        resultado["seleccionada"] & resultado["categoria_origen"].isin(origenes_o)
-    ]
-
-    # Las 8 categorías o1..o8 eligen todas "popular" sin que el nuevo
-    # límite (holgado aquí) les quite ninguna.
-    assert (seleccionadas_desde_o["categoria_destino"] == "popular").sum() == 8
-
-
-def test_relevancia_manual_sin_datos_no_cambia_el_orden():
-    """Si no se rellena la tabla de relevancia manual, su valor por
-    defecto (0.5 para todas las categorías) no debe alterar el orden
-    de la propuesta, aunque su peso sea > 0.
-    """
-    datasets = _make_datasets()
-    weights = ScoringWeights(
-        volumen_busqueda=1.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-        relevancia_categoria=0.5,
-        prioridad_negocio=0.0,
-    )
-    resultado = generate_link_proposals(datasets, weights=weights)
-
-    desde_c = resultado[
-        (resultado["categoria_origen"] == "c") & (~resultado["pendiente_confirmar"])
-    ].sort_values("score", ascending=False)
-    orden_destinos = desde_c["categoria_destino"].tolist()
-    assert orden_destinos.index("b") < orden_destinos.index("a")
-
-
-def test_prioridad_negocio_manual_por_url_reordena_la_propuesta():
-    """Con peso 100% en prioridad de negocio manual, la URL a la que se
-    le haya asignado más prioridad debe ir primero, aunque tenga menos
-    volumen de búsqueda.
-    """
-    datasets = _make_datasets()
-    # "a" tiene menos volumen que "b" (1000 vs 8000), pero le damos a "a"
-    # una prioridad de negocio manual mucho mayor mediante el override por URL.
-    prioridad = pd.DataFrame({"url": ["a", "b"], "prioridad_negocio": [1.0, 0.0]})
-
-    weights = ScoringWeights(
-        volumen_busqueda=0.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-        relevancia_categoria=0.0,
-        prioridad_negocio=1.0,
-    )
-    resultado = generate_link_proposals(datasets, weights=weights, prioridad_negocio=prioridad)
-
-    desde_c = resultado[
-        (resultado["categoria_origen"] == "c") & (~resultado["pendiente_confirmar"])
-    ].sort_values("score", ascending=False)
-    orden_destinos = desde_c["categoria_destino"].tolist()
-    assert orden_destinos.index("a") < orden_destinos.index("b")
-
-
-def _make_datasets_con_grupos_aislados() -> InputDatasets:
-    # bf1/bf2: Black Friday. reb1/reb2: Rebajas. sp1/sp2: Special Price.
-    # nav1/nav2: Navidad. n1/n2: categorías normales.
-    urls = ["bf1", "bf2", "reb1", "reb2", "sp1", "sp2", "nav1", "nav2", "n1", "n2"]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame(
-        {
-            "url": urls,
-            "keyword": [f"kw_{u}" for u in urls],
-            "volumen": [100] * len(urls),
-        }
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": [
-                "Precios especiales",
-                "Precios especiales",
-                "Precios especiales",
-                "Precios especiales",
-                "Sofas",
-                "Sillas",
-                "Decoración",
-                "Decoración",
-                "Muebles",
-                "Muebles",
-            ],
-            "categoria_secundaria": [
-                "Black Friday",
-                "Black Friday",
-                "Rebajas",
-                "Rebajas",
-                "Special Price",
-                "Special Price",
-                "Navidad",
-                "Navidad",
-                "Salon",
-                "Salon",
-            ],
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-
-def test_grupos_aislados_black_friday_solo_enlaza_con_black_friday():
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    desde_bf1 = resultado[resultado["categoria_origen"] == "bf1"]
-    destinos = set(desde_bf1["categoria_destino"])
-    assert destinos == {"bf2"}
-
-
-def test_grupos_aislados_rebajas_solo_enlaza_con_rebajas():
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    desde_reb1 = resultado[resultado["categoria_origen"] == "reb1"]
-    destinos = set(desde_reb1["categoria_destino"])
-    assert destinos == {"reb2"}
-
-
-def test_grupos_aislados_black_friday_y_rebajas_no_se_mezclan():
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
-    assert ("bf1", "reb1") not in pares
-    assert ("reb1", "bf1") not in pares
-
-
-def test_grupos_aislados_no_afecta_a_categorias_normales():
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    desde_n1 = resultado[resultado["categoria_origen"] == "n1"]
-    destinos = set(desde_n1["categoria_destino"])
-    # n1 no debe poder enlazar a bf1/bf2/reb1/reb2/sp1/sp2, solo a n2.
-    assert destinos == {"n2"}
-
-
-def test_grupos_aislados_special_price_solo_enlaza_con_special_price():
-    """Special Price (descubierta en la taxonomía real de Sklum) se aísla
-    igual que Black Friday y Rebajas, por decisión explícita del usuario.
-    """
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    desde_sp1 = resultado[resultado["categoria_origen"] == "sp1"]
-    destinos = set(desde_sp1["categoria_destino"])
-    assert destinos == {"sp2"}
-
-
-def test_grupos_aislados_special_price_no_se_mezcla_con_black_friday_ni_rebajas():
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
-    assert ("sp1", "bf1") not in pares
-    assert ("bf1", "sp1") not in pares
-
-
-def test_grupos_aislados_navidad_solo_enlaza_con_navidad():
-    """Navidad (confirmada por el usuario el 30 sept, encontrada también
-    en la taxonomía real de Sklum con 13 URLs) se aísla igual que Black
-    Friday, Rebajas y Special Price: solo se enlaza consigo misma."""
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    desde_nav1 = resultado[resultado["categoria_origen"] == "nav1"]
-    destinos = set(desde_nav1["categoria_destino"])
-    assert destinos == {"nav2"}
-
-
-def test_grupos_aislados_navidad_no_se_mezcla_con_otros_grupos_ni_normales():
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-
-    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
-    assert ("nav1", "bf1") not in pares
-    assert ("nav1", "sp1") not in pares
-    assert ("nav1", "n1") not in pares
-    assert ("n1", "nav1") not in pares
-    assert ("sp1", "reb1") not in pares
-    assert ("reb1", "sp1") not in pares
-
-
-def test_grupos_aislados_obligatorios_no_se_pueden_desactivar_pasando_lista_vacia():
-    """Regla de negocio confirmada por el usuario el 30 sept: Black Friday,
-    Rebajas, Special Price y Navidad NUNCA se mezclan entre sí, y esto no
-    puede depender de que alguien borre o deje vacío el cuadro de
-    'categorías aisladas' de la interfaz (o llame a la función pasando
-    `grupos_aislados=[]` directamente). Aunque se pase una lista vacía, los
-    4 grupos obligatorios se siguen aplicando igual que si no se pasara
-    nada (`grupos_aislados=None`).
-    """
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets, grupos_aislados=[])
-
-    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
-    # Ningún cruce entre grupos aislados distintos, ni con categorías normales.
-    assert ("sp1", "bf1") not in pares
-    assert ("bf1", "sp1") not in pares
-    assert ("sp1", "reb1") not in pares
-    assert ("bf1", "reb1") not in pares
-    assert ("nav1", "bf1") not in pares
-    assert ("nav1", "n1") not in pares
-    # Y cada grupo se sigue enlazando consigo mismo con normalidad.
-    assert ("bf1", "bf2") in pares or ("bf2", "bf1") in pares
-    assert ("sp1", "sp2") in pares or ("sp2", "sp1") in pares
-
-
-def test_grupo_aislado_se_detecta_por_la_url_aunque_falte_en_la_categorizacion_manual():
-    """Bug real encontrado en el catálogo de Sklum (feedback del usuario,
-    1 oct): una categoría de Navidad cuya `categoria_secundaria` venía mal
-    etiquetada como "Textil hogar" (hueco de la categorización manual, no
-    del código) se enlazaba con categorías normales de Textil hogar como
-    si no perteneciera a ningún grupo aislado. Ahora el slug de la URL
-    (p.ej. '.../comprar-decoracion-de-navidad-verde') también cuenta como
-    señal, así que esta categoría se detecta como "navidad" aunque la
-    categorización manual no la mencione en absoluto.
-    """
-    urls = ["https://www.sklum.com/es/1-comprar-decoracion-de-navidad-verde", "nav1", "nav2", "textil1"]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame({"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [100] * len(urls)})
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Decoración", "Decoración", "Decoración", "Decoración"],
-            # OJO: la primera fila NO dice "Navidad" en ningún sitio de la
-            # categorización manual -- es justo el hueco que causaba el bug.
-            "categoria_secundaria": ["Textil hogar", "Navidad", "Navidad", "Textil hogar"],
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    datasets = InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-    resultado = generate_link_proposals(datasets)
-    desde_navidad_verde = resultado[resultado["categoria_origen"] == urls[0]]
-    destinos = set(desde_navidad_verde["categoria_destino"])
-    assert destinos == {"nav1", "nav2"}
-    assert "textil1" not in destinos
-
-
-def test_grupo_aislado_la_url_manda_sobre_una_categorizacion_manual_erronea():
-    """Bug real encontrado en el catálogo de Sklum (feedback del usuario,
-    1 oct): varias categorías de Black Friday y Rebajas venían etiquetadas
-    por error en `categoria_secundaria` como "Special Price", y por eso la
-    propuesta las enlazaba con Special Price de verdad -- justo la mezcla
-    que el usuario reportó. El slug de la URL (inequívoco, no se puede
-    escribir mal en una celda) ahora tiene prioridad sobre ese campo
-    manual cuando no coinciden.
-    """
-    urls = [
-        "https://www.sklum.com/es/1-comprar-ofertas-sillas-black-friday",  # mal etiquetada
-        "bf_real",
-        "sp_real1",
-        "sp_real2",
-    ]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame({"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [100] * len(urls)})
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Sillas", "Muebles", "Sofas", "Sillas"],
-            # La fila mal etiquetada dice "Special Price" en vez de
-            # "Black Friday", aunque su URL es inequívocamente Black Friday.
-            "categoria_secundaria": ["Special Price", "Black Friday", "Special Price", "Special Price"],
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    datasets = InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-    resultado = generate_link_proposals(datasets)
-    desde_mal_etiquetada = resultado[resultado["categoria_origen"] == urls[0]]
-    destinos = set(desde_mal_etiquetada["categoria_destino"])
-    # Debe enlazar con Black Friday de verdad (por la URL), NUNCA con
-    # Special Price (aunque así lo diga, por error, la categorización
-    # manual).
-    assert destinos == {"bf_real"}
-    assert "sp_real1" not in destinos
-    assert "sp_real2" not in destinos
-
-
-def test_grupos_aislados_parametro_solo_anade_grupos_extra_nunca_quita_los_obligatorios():
-    """Pasar `grupos_aislados` con patrones custom (p.ej. desde el cuadro de
-    texto de 'categorías aisladas adicionales' en la interfaz) añade esos
-    grupos por encima de los 4 obligatorios, pero nunca los sustituye ni
-    los desactiva.
-    """
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets, grupos_aislados=["salon"])
-
-    pares = set(zip(resultado["categoria_origen"], resultado["categoria_destino"]))
-    # El grupo extra ("Salon") se aísla...
-    assert ("n1", "n2") in pares or ("n2", "n1") in pares  # n1/n2 son ambas "Salon"
-    # ...y los 4 obligatorios se mantienen intactos.
-    assert ("sp1", "bf1") not in pares
-    assert ("bf1", "sp1") not in pares
-
+from core.data_loader import InputDatasets, normalize_url
 
 # ---------------------------------------------------------------------------
-# Señales nuevas: autoridad de origen, presupuesto de enlaces salientes,
-# salud técnica del destino y Search Console (oportunidad SEO).
+# 1) Tabla maestra: una fila por URL indexable con todos sus atributos
 # ---------------------------------------------------------------------------
 
 
-def _make_datasets_senales_origen() -> InputDatasets:
-    """o1 tiene mucha autoridad (recibe enlaces de x1/x2/x3) pero también
-    ya tiene mucho presupuesto de enlaces salientes gastado (enlaza a
-    x1/x2/x3). o2 no tiene ninguna de las dos cosas. d1 es un destino
-    neutro al que ambos pueden enlazar.
+def _build_relevancia_lookup(relevancia_categoria: pd.DataFrame | None) -> dict[tuple[str, str], float]:
+    """Construye un diccionario {(categoria_principal, categoria_secundaria): relevancia}.
+
+    Una fila con `categoria_secundaria` vacía se interpreta como
+    "aplica a toda la categoría principal, sea cual sea la
+    subcategoría" (igual que en la plantilla de Sheets: hay una tabla
+    de relevancia por categoría principal y otra, aparte, por
+    subcategoría).
     """
-    urls = ["o1", "o2", "d1", "x1", "x2", "x3"]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame(
-        {"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [100] * len(urls)}
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(
-        {
-            "source_url": ["x1", "x2", "x3", "o1", "o1", "o1"],
-            "destination_url": ["o1", "o1", "o1", "x1", "x2", "x3"],
-            "anchor_text": [""] * 6,
-            "zona": ["Content"] * 6,
-        }
-    )
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
+    lookup: dict[tuple[str, str], float] = {}
+    if relevancia_categoria is None or relevancia_categoria.empty:
+        return lookup
+    for _, row in relevancia_categoria.iterrows():
+        principal = str(row.get("categoria_principal", "") or "").strip().lower()
+        secundaria = str(row.get("categoria_secundaria", "") or "").strip().lower()
+        if not principal:
+            continue
+        try:
+            valor = float(row.get("relevancia"))
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(valor):
+            continue
+        lookup[(principal, secundaria)] = valor
+    return lookup
 
 
-def test_autoridad_origen_prioriza_categorias_origen_con_mas_enlaces_entrantes():
-    datasets = _make_datasets_senales_origen()
-    weights = ScoringWeights(
-        volumen_busqueda=0.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-        autoridad_origen=1.0,
-    )
-    resultado = generate_link_proposals(datasets, weights=weights)
-
-    hacia_d1 = resultado[
-        (resultado["categoria_destino"] == "d1") & (~resultado["pendiente_confirmar"])
-    ].set_index("categoria_origen")
-    # o1 recibe 3 enlaces entrantes (de x1/x2/x3), o2 no recibe ninguno.
-    assert hacia_d1.loc["o1", "score"] > hacia_d1.loc["o2", "score"]
-
-
-def test_presupuesto_enlaces_origen_prioriza_categorias_con_menos_salientes():
-    datasets = _make_datasets_senales_origen()
-    weights = ScoringWeights(
-        volumen_busqueda=0.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-        presupuesto_enlaces_origen=1.0,
-    )
-    resultado = generate_link_proposals(datasets, weights=weights)
-
-    hacia_d1 = resultado[
-        (resultado["categoria_destino"] == "d1") & (~resultado["pendiente_confirmar"])
-    ].set_index("categoria_origen")
-    # o1 ya tiene 3 enlaces salientes (a x1/x2/x3), o2 no tiene ninguno:
-    # o2 debe tener más "presupuesto" disponible y por tanto más score.
-    assert hacia_d1.loc["o2", "score"] > hacia_d1.loc["o1", "score"]
-
-
-def _make_datasets_salud_tecnica() -> InputDatasets:
-    urls = ["origen", "d_ok", "d_roto", "d_noindex"]
-    crawl = pd.DataFrame(
-        {
-            "url": urls,
-            "num_productos": [10, 10, 10, 10],
-            "status_code": [200, 200, 404, 200],
-            "indexable": [True, True, True, False],
-        }
-    )
-    volumen = pd.DataFrame(
-        {"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [100] * len(urls)}
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-
-def test_salud_tecnica_excluye_destinos_caidos_o_no_indexables():
-    datasets = _make_datasets_salud_tecnica()
-    resultado = generate_link_proposals(datasets)
-
-    destinos = set(resultado["categoria_destino"])
-    assert "d_roto" not in destinos
-    assert "d_noindex" not in destinos
-    assert "d_ok" in destinos
-
-
-def test_oportunidad_posicion_score_pico_en_el_rango_configurado():
-    oportunidad = OportunidadSEO(posicion_min=4.0, posicion_max=20.0, ventana_decaimiento=30.0)
-
-    assert oportunidad_posicion_score(10, oportunidad) == 1.0
-    assert oportunidad_posicion_score(4, oportunidad) == 1.0
-    assert oportunidad_posicion_score(20, oportunidad) == 1.0
-    # Posición 1 (ya muy bien posicionada): decae hacia 0 pero no es 0.
-    assert 0.0 < oportunidad_posicion_score(1, oportunidad) < 1.0
-    # Posición muy alejada: decae a 0 dentro de la ventana configurada.
-    assert oportunidad_posicion_score(50, oportunidad) == 0.0
-    # Sin dato de posición: NaN, no un número inventado.
-    assert pd.isna(oportunidad_posicion_score(None, oportunidad))
-    assert pd.isna(oportunidad_posicion_score(float("nan"), oportunidad))
-
-
-def test_search_console_prioriza_posicion_en_zona_de_oportunidad():
-    datasets = _make_datasets()  # a, b, c (con volumen), d (pendiente)
-    search_console = pd.DataFrame(
-        {
-            "url": ["a", "b"],
-            "clics_28d": [5, 50],
-            "impresiones_28d": [500, 500],
-            # "a" está en la zona de oportunidad por defecto (4-20);
-            # "b" ya está en posición 1, fuera de la zona (decae).
-            "posicion_media": [10, 1],
-        }
-    )
-    weights = ScoringWeights(
-        volumen_busqueda=0.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-        posicion_oportunidad=1.0,
-    )
-    resultado = generate_link_proposals(datasets, weights=weights, search_console=search_console)
-
-    desde_c = resultado[
-        (resultado["categoria_origen"] == "c") & (~resultado["pendiente_confirmar"])
-    ].sort_values("score", ascending=False)
-    orden_destinos = desde_c["categoria_destino"].tolist()
-    assert orden_destinos.index("a") < orden_destinos.index("b")
-
-
-def test_pesos_search_console_sin_dataset_no_rompen_ni_afectan():
-    """Si no se sube Search Console, los pesos de oportunidad SEO deben
-    quedar sin efecto (igual que relevancia/prioridad manual sin
-    rellenar), no lanzar una excepción ni marcar nada como pendiente.
+def _lookup_relevancia(
+    principal: str | None, secundaria: str | None, lookup: dict[tuple[str, str], float]
+) -> float:
+    """Valor por defecto 0.5 (neutro) si no hay ajuste manual para esa
+    categoría/subcategoría. Nunca marca `pendiente_confirmar`: es un
+    ajuste opcional de negocio, no un dato obligatorio de entrada.
     """
-    datasets = _make_datasets()
-    weights = ScoringWeights(posicion_oportunidad=1.0, impresiones_busqueda=1.0)
-    resultado = generate_link_proposals(datasets, weights=weights)
-
-    validas = resultado[resultado["categoria_destino"] != "d"]
-    assert validas["pendiente_confirmar"].sum() == 0
-    assert validas["score"].notna().all()
-
-
-def test_comparar_evolucion_search_console_calcula_deltas():
-    actual = pd.DataFrame(
-        {
-            "url": ["a", "b"],
-            "clics_28d": [20, 5],
-            "impresiones_28d": [1000, 2000],
-            "posicion_media": [6, 15],
-        }
-    )
-    anterior = pd.DataFrame(
-        {
-            "url": ["a", "b"],
-            "clics_28d": [10, 5],
-            "impresiones_28d": [800, 2000],
-            "posicion_media": [9, 15],
-        }
-    )
-    out = comparar_evolucion_search_console(actual, anterior).set_index("url")
-
-    assert out.loc["a", "delta_clics"] == 10
-    assert out.loc["a", "delta_impresiones"] == 200
-    # Posición mejoró de 9 a 6 → delta positivo de 3 puestos.
-    assert out.loc["a", "delta_posicion"] == 3
-    assert out.loc["b", "delta_clics"] == 0
-    assert out.loc["b", "delta_posicion"] == 0
+    p = str(principal or "").strip().lower()
+    s = str(secundaria or "").strip().lower()
+    if (p, s) in lookup:
+        return lookup[(p, s)]
+    if (p, "") in lookup:
+        return lookup[(p, "")]
+    return 0.5
 
 
-def test_extraer_id_de_url_toma_el_id_numerico_del_slug():
-    """Las URLs de categoría de Sklum siempre llevan el ID numérico al
-    principio del último segmento de la ruta (p.ej. '524-comprar-...').
-    Si no sigue ese patrón, no debe romper — simplemente no hay id.
+def build_master_table(
+    datasets: InputDatasets,
+    relevancia_categoria: pd.DataFrame | None = None,
+    prioridad_negocio: pd.DataFrame | None = None,
+    grupos_aislados: list[str] | None = None,
+    search_console: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Cruza crawl + volumen + taxonomía por URL y añade el nº de
+    enlaces entrantes y salientes actuales (a partir del dataset de
+    enlaces), la salud técnica (si el crawl la trae) y el rendimiento en
+    Search Console (opcional), más los dos ajustes MANUALES de negocio
+    opcionales:
+
+    - `relevancia_categoria`: tabla con columnas `categoria_principal`,
+      `categoria_secundaria` (opcional) y `relevancia` (0-1) — el
+      equipo la ajusta a mano desde la interfaz para dar más o menos
+      importancia a ciertas categorías (p.ej. mensualmente).
+    - `prioridad_negocio`: tabla con columnas `url` y
+      `prioridad_negocio` — para penalizar o beneficiar URLs concretas
+      por motivos de negocio puntuales.
+    - `search_console`: tabla con columnas `url`, `clics_28d`,
+      `impresiones_28d`, `posicion_media` (ver
+      `core.data_loader.load_search_console`). Opcional: si no se pasa
+      (o viene vacía), las URLs quedan sin estos datos y los pesos que
+      dependen de ellos (`posicion_oportunidad`, `impresiones_busqueda`)
+      no tienen ningún efecto, por mucho que se suban por encima de 0
+      desde la interfaz — el mismo comportamiento "neutro por defecto"
+      que ya tienen `relevancia_categoria` y `prioridad_negocio`.
+
+    La base es el crawl (las categorías indexables). Si una URL del
+    crawl no aparece en volumen o en taxonomía, se marca con
+    `falta_volumen` / `falta_taxonomia` en lugar de asumir un valor por
+    defecto (p.ej. volumen=0), tal y como pide el punto 5 del encargo.
+    Los dos ajustes manuales, al ser opcionales por diseño, sí tienen un
+    valor neutro por defecto (0.5 / 0.0) cuando no se han rellenado.
     """
-    assert extraer_id_de_url("https://www.sklum.com/es/524-comprar-mobiliario") == "524"
-    assert (
-        extraer_id_de_url("https://www.sklum.com/es/30227-comprar-muebles-de-tv-blancos/")
-        == "30227"
+    master = datasets.crawl.merge(datasets.volumen, on="url", how="left")
+    master = master.merge(datasets.taxonomia, on="url", how="left")
+
+    master["falta_volumen"] = master["volumen"].isna()
+    master["falta_taxonomia"] = master["categoria_principal"].isna() | (
+        master["categoria_principal"].astype(str).str.strip() == ""
     )
-    assert extraer_id_de_url("https://www.sklum.com/es/sin-id-numerico") == ""
-    assert extraer_id_de_url("") == ""
-    assert extraer_id_de_url(None) == ""
+    # Igual que `falta_volumen`/`falta_taxonomia`: si el nº de productos no
+    # se ha podido interpretar (columna vacía, o texto en un formato que
+    # `_parse_num_productos` no reconoce), NO se asume un valor por
+    # defecto — la URL se marca pendiente de confirmar en vez de dejar
+    # que el score salga silenciosamente en NaN (ver `_calcular_scores_bloque`).
+    master["falta_num_productos"] = master["num_productos"].isna()
 
+    if "status_code" not in master.columns:
+        master["status_code"] = float("nan")
+    if "indexable" not in master.columns:
+        master["indexable"] = None
+    if "profundidad" not in master.columns:
+        master["profundidad"] = float("nan")
 
-def test_build_formato_ancho_una_fila_por_origen_con_enlaces_en_columnas():
-    """Formato heredado del flujo anterior en Sheets: una fila por URL
-    origen con su id, y los enlaces YA SELECCIONADOS (no todos los
-    candidatos) como pares linked_id_N/linked_url_N (+ categoría,
-    subcategoría, score y justificación de cada enlace), ordenados de
-    mayor a menor score. El nº de bloques de columnas se ajusta al mayor
-    nº de enlaces seleccionados que tenga cualquier origen, no viene fijo
-    a 5.
-    """
-    url_524 = "https://www.sklum.com/es/524-comprar-mobiliario"
-    url_30227 = "https://www.sklum.com/es/30227-comprar-muebles-de-tv-blancos"
-    url_18374 = "https://www.sklum.com/es/18374-comprar-muebles-de-tv-nordicos"
-    url_526 = "https://www.sklum.com/es/526-comprar-accesorios-lamparas"
-    url_4695 = "https://www.sklum.com/es/4695-comprar-lamparas-rusticas"
-    url_no_seleccionada = "https://www.sklum.com/es/999-no-seleccionada"
+    if not datasets.enlaces.empty:
+        entrantes = (
+            datasets.enlaces.groupby("destination_url")
+            .size()
+            .rename("enlaces_entrantes_actuales")
+        )
+        master = master.merge(
+            entrantes, left_on="url", right_index=True, how="left"
+        )
+        salientes = (
+            datasets.enlaces.groupby("source_url")
+            .size()
+            .rename("enlaces_salientes_actuales")
+        )
+        master = master.merge(
+            salientes, left_on="url", right_index=True, how="left"
+        )
+    else:
+        master["enlaces_entrantes_actuales"] = 0
+        master["enlaces_salientes_actuales"] = 0
+    master["enlaces_entrantes_actuales"] = master["enlaces_entrantes_actuales"].fillna(0)
+    master["enlaces_salientes_actuales"] = master["enlaces_salientes_actuales"].fillna(0)
 
-    resultado = pd.DataFrame(
-        {
-            "categoria_origen": [url_524, url_524, url_526, url_524],
-            "categoria_destino": [url_30227, url_18374, url_4695, url_no_seleccionada],
-            "categoria_principal_origen": ["Muebles", "Muebles", "Iluminación", "Muebles"],
-            "categoria_secundaria_origen": ["", "", "", ""],
-            "categoria_principal_destino": ["Muebles", "Salón", "Iluminación", "Muebles"],
-            "categoria_secundaria_destino": ["", "", "", ""],
-            "volumen_destino": [500, 200, 300, 100],
-            "enlaces_entrantes_actuales_destino": [1, 5, 0, 2],
-            "score": [0.9, 0.8, 0.7, 0.95],
-            "seleccionada": [True, True, True, False],
-        }
+    if search_console is not None and not search_console.empty:
+        master = master.merge(
+            search_console[["url", "clics_28d", "impresiones_28d", "posicion_media"]],
+            on="url",
+            how="left",
+        )
+    else:
+        master["clics_28d"] = float("nan")
+        master["impresiones_28d"] = float("nan")
+        master["posicion_media"] = float("nan")
+
+    relevancia_lookup = _build_relevancia_lookup(relevancia_categoria)
+    master["relevancia_categoria"] = master.apply(
+        lambda r: _lookup_relevancia(r["categoria_principal"], r["categoria_secundaria"], relevancia_lookup),
+        axis=1,
     )
 
-    ancho = build_formato_ancho(resultado)
+    if prioridad_negocio is not None and not prioridad_negocio.empty:
+        prio = prioridad_negocio.copy()
+        prio["url"] = prio["url"].map(normalize_url)
+        prio = prio.groupby("url")["prioridad_negocio"].mean().rename("prioridad_negocio")
+        master = master.merge(prio, on="url", how="left")
+    else:
+        master["prioridad_negocio"] = 0.0
+    master["prioridad_negocio"] = master["prioridad_negocio"].fillna(0.0)
 
-    assert list(ancho.columns) == [
-        "id",
-        "url",
-        "h1",
-        "categoria_principal",
-        "categoria_secundaria",
-        "n_enlaces",
-        "motivo_num_enlaces",
-        "linked_id_1",
-        "linked_url_1",
-        "linked_h1_1",
-        "linked_category_1",
-        "linked_subcategory_1",
-        "linked_score_1",
-        "justificacion_1",
-        "linked_id_2",
-        "linked_url_2",
-        "linked_h1_2",
-        "linked_category_2",
-        "linked_subcategory_2",
-        "linked_score_2",
-        "justificacion_2",
-    ]
-
-    fila_524 = ancho[ancho["url"] == url_524].iloc[0]
-    assert fila_524["id"] == "524"
-    assert fila_524["categoria_principal"] == "Muebles"
-    assert fila_524["n_enlaces"] == 2
-    assert fila_524["linked_id_1"] == "30227"
-    assert fila_524["linked_url_1"] == url_30227
-    assert fila_524["linked_category_1"] == "Muebles"
-    assert fila_524["linked_score_1"] == 0.9
-    # Misma categoría (Muebles) + tiene volumen -> ambas razones deben
-    # aparecer en la justificación, en lenguaje llano.
-    assert "misma categoría" in fila_524["justificacion_1"]
-    assert "volumen de búsqueda" in fila_524["justificacion_1"]
-    assert fila_524["linked_id_2"] == "18374"
-    assert fila_524["linked_url_2"] == url_18374
-
-    fila_526 = ancho[ancho["url"] == url_526].iloc[0]
-    assert fila_526["id"] == "526"
-    assert fila_526["n_enlaces"] == 1
-    assert fila_526["linked_id_1"] == "4695"
-    # Solo tiene 1 enlace seleccionado -> la 2ª columna queda vacía (NaN).
-    assert pd.isna(fila_526["linked_id_2"])
-    # La propuesta descartada (seleccionada=False) no debe aparecer en
-    # ninguna columna, ni siquiera de otro origen.
-    assert url_no_seleccionada not in ancho.filter(like="linked_url").values
-
-
-def test_justificacion_cae_a_un_mensaje_generico_si_no_hay_ninguna_senal_disponible():
-    """Si `resultado` no trae ninguna de las columnas informativas (p.ej.
-    una integración externa que solo pase categoria_origen/destino +
-    score), la justificación no debe fallar: debe caer a un mensaje
-    genérico basado en el score.
-    """
-    resultado = pd.DataFrame(
-        {
-            "categoria_origen": ["https://www.sklum.com/es/1-a"],
-            "categoria_destino": ["https://www.sklum.com/es/2-b"],
-            "score": [0.42],
-            "seleccionada": [True],
-        }
+    patrones_grupo = _combinar_con_grupos_obligatorios(grupos_aislados)
+    master["grupo_aislado"] = master.apply(
+        lambda r: _detectar_grupo_aislado(
+            r["categoria_principal"], r["categoria_secundaria"], patrones_grupo, r["url"]
+        ),
+        axis=1,
     )
-    ancho = build_formato_ancho(resultado)
-    assert "0.42" in ancho.iloc[0]["justificacion_1"]
 
+    master["id"] = master["url"].map(extraer_id_de_url)
+    if "h1" not in master.columns:
+        master["h1"] = ""
+    master["h1"] = master["h1"].fillna("").astype(str).str.strip()
+    sin_h1 = master["h1"] == ""
+    master.loc[sin_h1, "h1"] = master.loc[sin_h1, "url"].map(_derivar_titulo_desde_url)
 
-def test_build_formato_ancho_sin_seleccionadas_devuelve_tabla_vacia():
-    resultado = pd.DataFrame(
-        {
-            "categoria_origen": ["https://www.sklum.com/es/1-a"],
-            "categoria_destino": ["https://www.sklum.com/es/2-b"],
-            "score": [0.5],
-            "seleccionada": [False],
-        }
-    )
-    ancho = build_formato_ancho(resultado)
-    assert ancho.empty
-    assert list(ancho.columns) == [
-        "id",
-        "url",
-        "h1",
-        "categoria_principal",
-        "categoria_secundaria",
-        "n_enlaces",
-        "motivo_num_enlaces",
-    ]
-
-
-def test_generate_link_proposals_no_cambia_al_procesar_por_bloques_pequenos():
-    """`generate_link_proposals` cruza el catálogo por bloques de
-    categorías origen (`core.scoring._BATCH_SIZE`, un nº de filas
-    objetivo por bloque) para no construir todo el producto cartesiano en
-    memoria de golpe con catálogos grandes. El resultado no debe depender
-    del tamaño de bloque: aquí se fuerza un tamaño de bloque minúsculo (1
-    categoría origen por bloque, más bloques que URLs) y se compara con
-    el resultado "normal" para un dataset con más de un origen.
-    """
-    import core.scoring as scoring_module
-
-    datasets = _make_datasets()  # a, b, c (con volumen), d (pendiente)
-
-    original = generate_link_proposals(datasets)
-
-    valor_original = scoring_module._BATCH_SIZE
-    try:
-        scoring_module._BATCH_SIZE = 1  # fuerza 1 categoría origen por bloque
-        con_bloques_de_1 = generate_link_proposals(datasets)
-    finally:
-        scoring_module._BATCH_SIZE = valor_original
-
-    pd.testing.assert_frame_equal(
-        original.reset_index(drop=True), con_bloques_de_1.reset_index(drop=True)
-    )
+    return master.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# diagnosticar_datasets: diagnóstico automático de por qué una propuesta
-# ha salido vacía (o casi vacía)
+# 1.1) Grupos aislados (p.ej. Black Friday, Rebajas): categorías que SOLO
+# pueden enlazarse entre sí mismas, nunca con el resto del catálogo ni
+# entre grupos distintos. Es una restricción dura de negocio, no un peso
+# de scoring: si no coinciden, el par ni siquiera se genera como candidato.
 # ---------------------------------------------------------------------------
 
+DEFAULT_GRUPOS_AISLADOS: tuple[str, ...] = ("black friday", "rebajas", "special price", "navidad")
 
-def test_diagnosticar_datasets_caso_sano_no_da_motivo_de_bloqueo_total():
-    """Con un dataset normal (el mismo que usan el resto de tests, donde
-    SÍ se generan filas) el diagnóstico no debe señalar ni la salud
-    técnica ni la taxonomía como causa de bloqueo total: como mucho el
-    motivo genérico de "no se descarta nada por los filtros básicos".
+
+def _combinar_con_grupos_obligatorios(grupos_aislados: list[str] | None) -> list[str]:
+    """Combina los patrones que pase el usuario (UI o llamada directa) con los
+    4 grupos OBLIGATORIOS de `DEFAULT_GRUPOS_AISLADOS`.
+
+    Regla de negocio confirmada explícitamente por el cliente: Black Friday,
+    Rebajas, Special Price y Navidad NUNCA pueden enlazarse entre sí ni con
+    el resto del catálogo — cada uno solo enlaza dentro de su propio grupo.
+    Esto no es una preferencia configurable: da igual que `grupos_aislados`
+    llegue vacío, con solo alguno de los 4, o incluso como `[]` explícito
+    (por ejemplo si alguien borra el cuadro de texto de la interfaz por
+    error) — los 4 patrones por defecto se aplican SIEMPRE. `grupos_aislados`
+    solo sirve para AÑADIR grupos aislados extra por encima de esos 4, nunca
+    para quitarlos.
     """
-    datasets = _make_datasets()
-    diagnostico = diagnosticar_datasets(datasets)
+    combinados = list(DEFAULT_GRUPOS_AISLADOS)
+    if grupos_aislados:
+        existentes = {p.strip().lower() for p in combinados}
+        for patron in grupos_aislados:
+            p = str(patron).strip()
+            if p and p.lower() not in existentes:
+                combinados.append(p)
+                existentes.add(p.lower())
+    return combinados
 
-    assert diagnostico["n_crawl"] == 4
-    assert diagnostico["urls_crawl_con_volumen"] == 3
-    assert diagnostico["urls_crawl_con_taxonomia"] == 4
-    assert diagnostico["n_destino_saludable"] == 4
-    assert "columna equivocada" not in diagnostico["motivo_probable"]
-    assert "taxonomía asociada" not in diagnostico["motivo_probable"]
 
+def _detectar_grupo_aislado(
+    categoria_principal: str | None,
+    categoria_secundaria: str | None,
+    patrones: list[str],
+    url: str | None = None,
+) -> str:
+    """Devuelve el patrón (en minúsculas) que coincide con esta URL, o ""
+    si no pertenece a ningún grupo aislado (categoría "normal", sin
+    restricción).
 
-def test_diagnosticar_datasets_detecta_columna_de_salud_mal_detectada():
-    """Si (por un mapeo de columnas equivocado, p.ej. una columna real
-    llamada "No_Indexable" detectada como si fuera "Indexable") todas las
-    URLs quedan marcadas como no indexables, el diagnóstico debe
-    señalarlo como la causa más probable de que la propuesta salga
-    vacía, en vez de limitarse al mensaje genérico.
+    El SLUG de la URL se mira PRIMERO y manda sobre la categorización
+    manual cuando ambos dan una respuesta distinta: el slug es un hecho
+    técnico (p.ej. "...-black-friday") que no se puede escribir mal en
+    una celda de Excel, mientras que `categoria_secundaria` es un campo
+    rellenado a mano y, revisando el catálogo real, se han encontrado
+    varias categorías de Black Friday / Rebajas etiquetadas por error
+    como "Special Price" (y alguna de Navidad sin etiquetar en absoluto).
+    Si el slug no da ninguna coincidencia, se recurre a
+    `categoria_principal` + `categoria_secundaria` como hasta ahora (para
+    los grupos aislados que el equipo añada a mano y que no sigan ningún
+    patrón de URL concreto).
+
+    Coincidencia por subcadena e insensible a mayúsculas. Cuando una URL
+    coincide con MÁS DE UN patrón a la vez (p.ej. una categoría puntual
+    "especial-price-navidad" o "navidad-black-friday", que existen en el
+    catálogo), se resuelve de forma determinista por el orden de
+    `patrones` (los 4 obligatorios van en el orden Black Friday > Rebajas
+    > Special Price > Navidad) — no hay una respuesta "correcta" única
+    para esos casos límite, así que al menos es siempre la misma.
     """
-    datasets = _make_datasets()
-    datasets.crawl = datasets.crawl.copy()
-    datasets.crawl["indexable"] = False  # todas las URLs "no indexables"
+    texto_url = str(url or "").lower()
+    for patron in patrones:
+        p = str(patron).strip().lower()
+        p_url = p.replace(" ", "-")
+        if p and (p_url in texto_url or p in texto_url):
+            return p
 
-    diagnostico = diagnosticar_datasets(datasets)
+    texto_manual = f"{categoria_principal or ''} {categoria_secundaria or ''}".strip().lower()
+    for patron in patrones:
+        p = str(patron).strip().lower()
+        if p and p in texto_manual:
+            return p
+    return ""
 
-    assert diagnostico["n_destino_saludable"] == 0
-    assert "columna equivocada" in diagnostico["motivo_probable"] or "columna distinta" in diagnostico["motivo_probable"]
 
-
-def test_diagnosticar_datasets_detecta_taxonomia_sin_solape_con_crawl():
-    """Si el crawl y la taxonomía no comparten ninguna URL (p.ej. porque
-    se ha usado una columna de URL distinta para cada uno dentro del
-    mismo fichero), el diagnóstico debe señalarlo explícitamente en vez
-    de quedarse en el motivo genérico de categorías compartidas.
+def _normalize_min_max(series: pd.Series, *, invert: bool = False) -> pd.Series:
+    """Normaliza a [0, 1]. Los NaN se preservan (no se imputan). Si
+    todos los valores válidos son iguales, se devuelve 0.5 para todos
+    ellos (no hay señal para diferenciar).
     """
-    datasets = _make_datasets()
-    datasets.taxonomia = pd.DataFrame(
-        {
-            "url": ["x", "y", "z", "w"],
-            "categoria_principal": ["Muebles", "Muebles", "Iluminacion", "Muebles"],
-            "categoria_secundaria": ["Salon", "Salon", "Techo", "Dormitorio"],
+    values = series.astype(float)
+    if invert:
+        values = -values
+    valid = values.dropna()
+    if valid.empty:
+        return pd.Series([float("nan")] * len(series), index=series.index)
+    vmin, vmax = valid.min(), valid.max()
+    if vmax == vmin:
+        return values.where(values.isna(), 0.5)
+    return (values - vmin) / (vmax - vmin)
+
+
+def comparar_evolucion_search_console(actual: pd.DataFrame, anterior: pd.DataFrame) -> pd.DataFrame:
+    """Compara dos exports de Search Console (mismas columnas que
+    devuelve `core.data_loader.load_search_console`: `url`, `clics_28d`,
+    `impresiones_28d`, `posicion_media`) y devuelve, por cada URL
+    presente en ambos, la variación de cada métrica entre `anterior` y
+    `actual`. Pensado para ver mes a mes si las categorías que
+    recibieron enlaces nuevos van mejorando.
+
+    `delta_posicion` positivo = mejora (ha subido puestos, la posición
+    media ha bajado numéricamente); negativo = ha empeorado.
+    """
+    a = actual.rename(
+        columns={
+            "clics_28d": "clics_actual",
+            "impresiones_28d": "impresiones_actual",
+            "posicion_media": "posicion_actual",
         }
     )
-
-    diagnostico = diagnosticar_datasets(datasets)
-
-    assert diagnostico["urls_crawl_con_taxonomia"] == 0
-    assert diagnostico["n_categorias_principales_distintas"] <= 1
-    assert "Categoria_Principal" in diagnostico["motivo_probable"]
-
-
-def test_diagnosticar_datasets_con_menos_de_dos_urls_de_crawl():
-    datasets = _make_datasets()
-    datasets.crawl = datasets.crawl.iloc[:1].copy()
-
-    diagnostico = diagnosticar_datasets(datasets)
-
-    assert "menos de 2 URLs" in diagnostico["motivo_probable"]
-    assert "n_master" not in diagnostico
-
-
-# ---------------------------------------------------------------------------
-# generate_link_proposals(..., contador=...): diagnóstico del embudo de
-# filtrado, pensado para detectar en qué paso una propuesta se queda en
-# 0 filas (grupos aislados, salud del destino, enlaces ya existentes o un
-# score_minimo demasiado alto).
-# ---------------------------------------------------------------------------
-
-
-def test_contador_no_cambia_el_resultado_ni_falla_si_es_none():
-    datasets = _make_datasets()
-    sin_contador = generate_link_proposals(datasets)
-    con_contador = generate_link_proposals(datasets, contador={})
-    pd.testing.assert_frame_equal(
-        sin_contador.reset_index(drop=True), con_contador.reset_index(drop=True)
-    )
-
-
-def test_contador_detecta_score_minimo_demasiado_alto():
-    """Si el score mínimo configurado es más alto que cualquier score
-    real alcanzable, la propuesta sale vacía (0 seleccionadas) aunque
-    haya pares candidatos válidos de sobra — el contador debe dejar esto
-    clarísimo: pares_validos_con_score > 0, pero score_valido_maximo por
-    debajo del score_minimo usado, y pares_seleccionados == 0.
-    """
-    datasets = _make_datasets()
-    limites = LimitesPropuesta(max_enlaces_nuevos_por_origen=5, score_minimo=0.999)
-
-    contador: dict = {}
-    resultado = generate_link_proposals(datasets, limites=limites, contador=contador)
-
-    assert contador["pares_validos_con_score"] > 0
-    assert contador["score_valido_maximo"] is not None
-    assert contador["score_valido_maximo"] < 0.999
-    assert contador["pares_seleccionados"] == 0
-    # Las filas "pendiente_confirmar" (datos incompletos) se conservan
-    # siempre, pero ninguna fila válida queda marcada como seleccionada.
-    assert not resultado.empty
-    assert not resultado["seleccionada"].any()
-
-
-def test_falta_num_productos_marca_pendiente_en_vez_de_score_nan_silencioso():
-    """Si a una URL destino le falta el nº de productos (columna vacía o
-    texto irreconocible tras `_parse_num_productos`), la fila debe
-    marcarse `pendiente_confirmar` con un motivo explícito, en vez de
-    quedar como "válida" con un `score` en NaN que desaparece en
-    silencio del resultado final (esto es justo lo que provocaba que el
-    catálogo real de Sklum, con la columna Nº_Productos en un formato de
-    texto no reconocido, generase una propuesta con 0 filas: el score
-    salía en NaN para el 100% de los pares y ninguno superaba nunca el
-    score mínimo, pero tampoco se marcaba pendiente).
-    """
-    datasets = _make_datasets()
-    datasets.crawl = datasets.crawl.copy()
-    # "c" pierde su nº de productos.
-    datasets.crawl.loc[datasets.crawl["url"] == "c", "num_productos"] = float("nan")
-
-    resultado = generate_link_proposals(datasets)
-
-    hacia_c = resultado[resultado["categoria_destino"] == "c"]
-    assert not hacia_c.empty
-    assert hacia_c["pendiente_confirmar"].all()
-    assert hacia_c["score"].isna().all()
-    assert "nº de productos" in hacia_c["motivo_pendiente"].iloc[0]
-
-
-def test_contador_detecta_bloqueo_por_grupos_aislados():
-    """Si TODAS las categorías quedan aisladas en grupos distintos entre
-    sí (p.ej. un patrón de aislamiento tan amplio que separa el catálogo
-    en singletons), el embudo debe mostrar que los pares se pierden ya en
-    el primer filtro (grupo_aislado), antes incluso de llegar a salud
-    técnica o a enlaces existentes.
-    """
-    datasets = _make_datasets()  # categorías: a, b, c, d
-    contador: dict = {}
-    # Un patrón por URL (todas normalizadas a minúsculas) aísla cada
-    # categoría en su propio grupo de 1: ningún par sobrevive al filtro.
-    resultado = generate_link_proposals(
-        datasets, grupos_aislados=["salon", "techo", "dormitorio"], contador=contador
-    )
-
-    assert contador["pares_antes_de_filtros"] > 0
-    assert contador["pares_tras_grupo_aislado"] < contador["pares_antes_de_filtros"]
-    assert resultado is not None
-
-
-# ---------------------------------------------------------------------------
-# Reparto por rondas (decisión de negocio: demasiadas categorías se
-# quedaban con menos enlaces de los que les tocaban, no por falta real de
-# candidatos sino por el ORDEN en que se procesaban los pares) y
-# ampliación EXCEPCIONAL del cupo por origen (nunca como norma general,
-# siempre con un motivo explicado).
-# ---------------------------------------------------------------------------
-
-
-def _make_datasets_muchos_origenes_compiten_por_los_mismos_destinos() -> InputDatasets:
-    """9 categorías origen (o1..o9) que, usando solo el peso de volumen de
-    búsqueda (señal que depende únicamente del destino, igual para
-    cualquier origen), coinciden TODAS en el mismo orden de preferencia:
-    primero los 5 destinos "populares" (pop1..pop5, con más volumen),
-    luego los 10 "filler" (con volumen decreciente). Con un cupo de 8
-    enlaces entrantes nuevos por destino, cada uno de los 5 populares solo
-    puede servir a 8 de las 9 categorías origen — SIEMPRE se queda UNA
-    fuera en cada uno de esos 5 destinos. Si el reparto no permite a esa
-    categoría seguir probando más abajo en su lista (más allá de su
-    propio cupo de 5 "intentos"), se quedaría con menos enlaces de los
-    que le tocan aunque haya filler de sobra para completarlos.
-    """
-    populares = [f"pop{i}" for i in range(1, 6)]
-    fillers = [f"filler{i}" for i in range(1, 11)]
-    origenes = [f"o{i}" for i in range(1, 10)]
-    destinos = populares + fillers
-    urls = origenes + destinos
-
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumenes = (
-        [1000 - i * 10 for i in range(len(populares))]
-        + [400 - i * 10 for i in range(len(fillers))]
-        + [0] * len(origenes)
-    )
-    volumen = pd.DataFrame(
-        {
-            "url": destinos + origenes,
-            "keyword": [f"kw_{u}" for u in destinos + origenes],
-            "volumen": volumenes,
+    b = anterior.rename(
+        columns={
+            "clics_28d": "clics_anterior",
+            "impresiones_28d": "impresiones_anterior",
+            "posicion_media": "posicion_anterior",
         }
     )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
+    out = a.merge(b, on="url", how="inner")
+    out["delta_clics"] = out["clics_actual"] - out["clics_anterior"]
+    out["delta_impresiones"] = out["impresiones_actual"] - out["impresiones_anterior"]
+    out["delta_posicion"] = out["posicion_anterior"] - out["posicion_actual"]
+    out["delta_clics_pct"] = (
+        out["delta_clics"] / out["clics_anterior"].replace(0, pd.NA)
+    ) * 100
+    return out.sort_values("delta_clics", ascending=False).reset_index(drop=True)
 
 
-def test_reparto_por_rondas_permite_completar_cupo_probando_candidatos_mas_abajo():
-    """Aunque 9 categorías origen coincidan en preferir los mismos 5
-    destinos "populares" (que solo pueden servir a 8 cada uno por el
-    límite de enlaces entrantes nuevos), TODAS deben poder completar su
-    cupo normal de 5 enlaces gracias a los destinos "filler": a la
-    categoría que se quede sin hueco en algún popular no se le puede
-    cortar la posibilidad de seguir probando más abajo en su lista.
+def oportunidad_posicion_score(posicion: float | None, oportunidad: OportunidadSEO) -> float:
+    """Puntúa de 0 a 1 cuánta "oportunidad" representa la posición media
+    de una URL en Search Console, según el rango configurado en
+    `oportunidad` (por defecto, posiciones 4-20 = zona de oportunidad):
+
+    - Dentro del rango [`posicion_min`, `posicion_max`]: 1.0 (máxima
+      prioridad — está "a las puertas" de mejorar bastante con un
+      empujón de enlaces internos).
+    - Mejor que `posicion_min` (posición más baja, ya en muy buen
+      puesto): decae linealmente hacia 0 a medida que se acerca a la
+      posición 0 — sigue aportando algo (mantener el puesto también
+      importa) pero con menos prioridad que las que están en la zona de
+      oportunidad.
+    - Peor que `posicion_max`: decae linealmente a lo largo de
+      `ventana_decaimiento` posiciones hasta llegar a 0 (posiciones muy
+      alejadas de la primera página no se consideran una oportunidad a
+      corto plazo).
+
+    Devuelve NaN si no hay dato de posición (no se subió Search Console,
+    o esa URL no aparece en el export).
     """
-    datasets = _make_datasets_muchos_origenes_compiten_por_los_mismos_destinos()
-    weights = ScoringWeights(
-        volumen_busqueda=1.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-    )
-    resultado = generate_link_proposals(datasets, weights=weights)
-    seleccionadas = resultado[resultado["seleccionada"]]
+    if posicion is None or (isinstance(posicion, float) and pd.isna(posicion)):
+        return float("nan")
+    if oportunidad.posicion_min <= posicion <= oportunidad.posicion_max:
+        return 1.0
+    if posicion < oportunidad.posicion_min:
+        if oportunidad.posicion_min <= 0:
+            return 1.0
+        return max(0.0, posicion / oportunidad.posicion_min)
+    ventana = oportunidad.ventana_decaimiento or 1.0
+    return max(0.0, 1.0 - (posicion - oportunidad.posicion_max) / ventana)
 
-    conteo_por_origen = seleccionadas["categoria_origen"].value_counts()
-    origenes = [f"o{i}" for i in range(1, 10)]
-    for origen in origenes:
-        assert conteo_por_origen.get(origen, 0) == 5, (
-            f"{origen} se quedó con {conteo_por_origen.get(origen, 0)} enlaces, "
-            "debería haber completado su cupo de 5 usando los destinos filler"
+
+def _sin_nan(valor: float) -> float:
+    """0.0 si el valor es NaN (dato opcional no disponible para esa
+    fila/dataset), el valor tal cual en otro caso. Así un peso > 0 sobre
+    una señal opcional sin datos no rompe el score de toda la fila (lo
+    trata como si esa señal no aportara nada), en vez de propagar NaN.
+    """
+    return 0.0 if (valor is None or (isinstance(valor, float) and pd.isna(valor))) else valor
+
+
+def affinity_score(
+    principal_origen: str | None,
+    secundaria_origen: str | None,
+    principal_destino: str | None,
+    secundaria_destino: str | None,
+    affinity: AffinityScores,
+) -> float | None:
+    """Devuelve la puntuación de afinidad de categoría entre origen y
+    destino, o None si no se puede calcular por falta de
+    categorización en alguno de los dos lados.
+    """
+    for value in (principal_origen, principal_destino):
+        if value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == "":
+            return None
+
+    if str(principal_origen).strip().lower() == str(principal_destino).strip().lower():
+        sec_o = str(secundaria_origen or "").strip().lower()
+        sec_d = str(secundaria_destino or "").strip().lower()
+        if sec_o and sec_d and sec_o == sec_d:
+            return affinity.misma_principal_y_secundaria
+        return affinity.misma_principal
+    return affinity.distinta
+
+
+# ---------------------------------------------------------------------------
+# 2) Exclusión de enlaces ya existentes y auto-enlaces
+# ---------------------------------------------------------------------------
+
+
+def exclude_existing_links(
+    candidates: pd.DataFrame, enlaces: pd.DataFrame
+) -> pd.DataFrame:
+    """Elimina de `candidates` (que debe tener columnas
+    `origen`/`destino`) cualquier par para el que ya exista un enlace
+    origen -> destino en `enlaces` (columnas `source_url` /
+    `destination_url`), en cualquier zona. También elimina los pares
+    origen == destino.
+
+    No se considera que un enlace destino -> origen (en sentido
+    contrario) bloquee la propuesta origen -> destino: son enlaces
+    distintos.
+
+    Implementado con `MultiIndex.isin` (vectorizado) en vez de
+    `.apply(..., axis=1)` fila a fila: con catálogos grandes, comparar
+    par a par en Python puro es uno de los puntos que más tiempo/memoria
+    consumía en el cruce completo (ver `generate_link_proposals`), y
+    aquí se puede evitar sin cambiar el resultado.
+    """
+    candidates = candidates[candidates["origen"] != candidates["destino"]]
+
+    if enlaces.empty or candidates.empty:
+        return candidates.reset_index(drop=True)
+
+    existing_index = pd.MultiIndex.from_arrays(
+        [enlaces["source_url"], enlaces["destination_url"]]
+    )
+    candidates_index = pd.MultiIndex.from_arrays(
+        [candidates["origen"], candidates["destino"]]
+    )
+    mask_existing = candidates_index.isin(existing_index)
+    return candidates[~mask_existing].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 3) Generación de la propuesta completa
+# ---------------------------------------------------------------------------
+
+RESULT_COLUMNS = [
+    "categoria_origen",
+    "id_origen",
+    "h1_origen",
+    "categoria_destino",
+    "id_destino",
+    "h1_destino",
+    "score",
+    "keyword_destino",
+    "volumen_destino",
+    "texto_ancla_sugerido",
+    "categoria_principal_origen",
+    "categoria_secundaria_origen",
+    "categoria_principal_destino",
+    "categoria_secundaria_destino",
+    "enlaces_entrantes_actuales_destino",
+    "enlaces_salientes_actuales_origen",
+    "profundidad_origen",
+    "num_productos_destino",
+    "relevancia_categoria_destino",
+    "prioridad_negocio_destino",
+    "posicion_media_destino",
+    "impresiones_28d_destino",
+    "clics_28d_destino",
+    "pendiente_confirmar",
+    "motivo_pendiente",
+    "seleccionada",
+    "motivo_num_enlaces_origen",
+]
+
+
+# Nº de filas (pares origen-destino) que como máximo se procesan de golpe
+# en cada bloque de `generate_link_proposals`. El tamaño de bloque, en Nº
+# de categorías ORIGEN, se recalcula según cuántas categorías destino
+# tenga el catálogo (`_BATCH_SIZE // nº de destinos`), para que el pico de
+# memoria dependa de esta constante y NO crezca con el tamaño del
+# catálogo: un catálogo con más URLs simplemente se parte en más bloques,
+# no en bloques más grandes. Probado con datos sintéticos: con
+# _BATCH_SIZE=250.000 el pico de memoria se mantiene por debajo de ~1 GB
+# tanto con 3.000 como con 6.000 URLs. No cambia el resultado, solo
+# cuánta memoria hace falta a la vez.
+_BATCH_SIZE = 250_000
+
+
+def _tamano_bloque_origenes(n_destinos: int) -> int:
+    return max(1, _BATCH_SIZE // max(n_destinos, 1))
+
+
+def _calcular_scores_bloque(
+    pairs: pd.DataFrame, weights: ScoringWeights, affinity: AffinityScores
+) -> pd.DataFrame:
+    """Calcula afinidad, motivo de "pendiente" y score para un bloque de
+    pares origen-destino ya filtrado (grupos aislados, salud técnica y
+    enlaces existentes ya excluidos). Antes esto se hacía fila a fila con
+    un bucle de Python (`itertuples` + `affinity_score`); aquí se hace
+    vectorizado con pandas/numpy sobre todo el bloque a la vez, que es
+    muchísimo más rápido con catálogos grandes y es lo que hace viable
+    procesar por bloques en vez de en una sola pasada gigante.
+
+    El resultado (columnas y valores) es idéntico al que producía el
+    bucle fila a fila original.
+    """
+    principal_o = pairs["categoria_principal_origen"].fillna("").astype(str).str.strip()
+    principal_d = pairs["categoria_principal_destino"].fillna("").astype(str).str.strip()
+    secundaria_o = pairs["categoria_secundaria_origen"].fillna("").astype(str).str.strip().str.lower()
+    secundaria_d = pairs["categoria_secundaria_destino"].fillna("").astype(str).str.strip().str.lower()
+
+    sin_categoria = (principal_o == "") | (principal_d == "")
+    misma_principal = principal_o.str.lower() == principal_d.str.lower()
+    misma_secundaria = misma_principal & (secundaria_o != "") & (secundaria_d != "") & (secundaria_o == secundaria_d)
+
+    afinidad = pd.Series(float("nan"), index=pairs.index)
+    afinidad = afinidad.mask(~sin_categoria & misma_secundaria, affinity.misma_principal_y_secundaria)
+    afinidad = afinidad.mask(~sin_categoria & misma_principal & ~misma_secundaria, affinity.misma_principal)
+    afinidad = afinidad.mask(~sin_categoria & ~misma_principal, affinity.distinta)
+    # sin_categoria se queda a NaN (afinidad "no calculable" = affinity_score
+    # devolviendo None en la versión anterior fila a fila).
+
+    falta_volumen_destino = pairs["falta_volumen_destino"]
+    falta_taxonomia_destino = pairs["falta_taxonomia_destino"]
+    falta_taxonomia_origen = pairs["falta_taxonomia_origen"]
+    falta_num_productos_destino = pairs["falta_num_productos_destino"]
+
+    pendiente = (
+        falta_volumen_destino
+        | falta_taxonomia_destino
+        | falta_taxonomia_origen
+        | falta_num_productos_destino
+        | afinidad.isna()
+    )
+
+    # El motivo textual solo depende de qué combinación de las 4 señales
+    # de "falta X" está activa (16 combinaciones posibles) — se calcula
+    # una vez por combinación, no fila a fila, y se asigna con `.map`.
+    combo = (
+        falta_volumen_destino.astype(int)
+        + falta_taxonomia_destino.astype(int) * 2
+        + falta_taxonomia_origen.astype(int) * 4
+        + falta_num_productos_destino.astype(int) * 8
+    )
+    motivo_por_combo = {}
+    for c in range(16):
+        partes_c = []
+        if c & 1:
+            partes_c.append("categoría destino sin volumen de búsqueda")
+        if c & 2:
+            partes_c.append("categoría destino sin categorización")
+        if c & 4:
+            partes_c.append("categoría origen sin categorización")
+        if c & 8:
+            partes_c.append("categoría destino sin nº de productos")
+        motivo_por_combo[c] = "; ".join(partes_c)
+    motivo = combo.map(motivo_por_combo)
+    # Caso residual: afinidad no calculable sin que ninguna de las 3
+    # señales lo explique (no debería darse en la práctica, ya que
+    # `sin_categoria` implica alguna de las `falta_taxonomia_*`, pero se
+    # cubre igual que en la versión anterior, por seguridad).
+    motivo = motivo.mask((motivo == "") & pendiente, "categorización incompleta")
+    motivo = motivo.mask(~pendiente, "")
+
+    score = (
+        weights.volumen_busqueda * pairs["norm_volumen_destino"]
+        + weights.muchos_productos * pairs["norm_muchos_productos_destino"]
+        + weights.pocos_enlaces_entrantes * pairs["norm_pocos_enlaces_destino"]
+        + weights.afinidad_categoria * afinidad.fillna(0.0)
+        + weights.relevancia_categoria * pairs["relevancia_categoria_destino"]
+        + weights.prioridad_negocio * pairs["prioridad_negocio_destino"]
+        + weights.autoridad_origen * pairs["norm_autoridad_origen"].fillna(0.0)
+        + weights.presupuesto_enlaces_origen * pairs["norm_presupuesto_enlaces_origen"].fillna(0.0)
+        + weights.posicion_oportunidad * pairs["posicion_oportunidad_destino"].fillna(0.0)
+        + weights.impresiones_busqueda * pairs["norm_impresiones_destino"].fillna(0.0)
+    )
+    score = score.mask(pendiente, float("nan"))
+
+    pairs = pairs.copy()
+    pairs["afinidad"] = afinidad
+    pairs["score"] = score
+    pairs["motivo_pendiente"] = motivo
+    pairs["pendiente_confirmar"] = pendiente
+    pairs["keyword_destino"] = pairs["keyword_destino"].fillna("")
+    pairs["texto_ancla_sugerido"] = pairs["keyword_destino"]
+    return pairs
+
+
+def _margen_candidatos_por_origen(limites: LimitesPropuesta) -> int:
+    """Cuántos candidatos por origen se conservan de cada bloque ANTES de
+    la selección final con presupuesto de destino (ver
+    `_recortar_bloque_a_lo_relevante` y `_seleccionar_con_presupuesto_destino`).
+
+    Tiene que ser mayor que el cupo máximo posible por origen (el
+    excepcional, no el normal: ver `LimitesPropuesta.max_enlaces_nuevos_por_origen_excepcional`):
+    si el destino mejor puntuado de un origen ya ha agotado su cupo de
+    enlaces nuevos (`max_enlaces_nuevos_por_destino`) porque otros
+    orígenes lo eligieron antes, hace falta tener a mano el siguiente
+    mejor candidato de ESE origen para poder sustituirlo — si solo
+    guardásemos el top "a secas" (como antes de repartir por destino),
+    ese origen se quedaría con menos enlaces de los que le tocan en vez
+    de pasar al siguiente candidato válido.
+    """
+    return max(limites.max_enlaces_nuevos_por_origen_excepcional * 10, 50)
+
+
+# Mismo mecanismo que `_margen_candidatos_por_origen`, pero para no perder
+# por el camino a las categorías DESTINO con score bajo (ver docstring de
+# `_recortar_bloque_a_lo_relevante`). No depende de ningún límite de
+# `LimitesPropuesta` -el margen de candidatos de RESERVA es independiente
+# de cuántos enlaces nuevos pueda acumular el destino al final (ver
+# `LimitesPropuesta.max_enlaces_nuevos_por_destino`)-, por eso es una
+# constante fija y no una función de los límites: 10 candidatos de reserva
+# por destino y por bloque es de sobra para que, entre todos los bloques
+# (cada uno aporta los suyos para la misma categoría destino), la
+# selección final y su rescate de mínimo siempre tengan con qué trabajar.
+_MARGEN_CANDIDATOS_POR_DESTINO = 10
+
+
+# Umbrales mínimos (absolutos, no solo relativos) para que los criterios
+# de ampliación excepcional de abajo no se activen "para todo el
+# catálogo a la vez" cuando los datos de enlaces internos son escasos o
+# vienen casi vacíos — ver `_elegibilidad_ampliacion_origen`.
+_MEDIANA_SALIENTES_MINIMA_PARA_ACTIVAR = 3
+_PERCENTIL_AUTORIDAD_MINIMO_PARA_ACTIVAR = 5
+_PERCENTIL_AUTORIDAD_ORIGEN = 0.9
+_MAX_SALIENTES_PARA_AMPLIAR = 2
+
+# Rendimiento real en Search Console (opcional, requiere subir el export
+# de GSC): una categoría con muchos clics en los últimos 28 días ya ha
+# demostrado tener autoridad/relevancia de verdad para el usuario final,
+# no solo "sobre el papel" vía enlaces internos — decisión de negocio del
+# 1 oct ("si tienen mucho rendimiento en GSC es que tienen autoridad").
+# Misma salvaguarda que las demás: si casi nadie tiene datos de GSC o el
+# tráfico es residual en todo el catálogo, no se activa.
+_PERCENTIL_GSC_ORIGEN = 0.9
+_CLICS_MINIMO_PARA_ACTIVAR = 20
+
+# Profundidad de rastreo (opcional, ver `core.data_loader.PROFUNDIDAD_CANDIDATES`):
+# una categoría muy cerca de la home (percentil 10 más bajo de profundidad
+# del catálogo) se considera también "mucha autoridad interna" estructural,
+# igual que tener muchos enlaces entrantes -es, de hecho, la señal de
+# autoridad interna más estándar en SEO, y no depende de que el dataset de
+# enlaces esté completo-. Salvaguarda equivalente a la de enlaces entrantes:
+# si el catálogo entero es "plano" (todo a 1-2 clics de la home, típico de
+# webs pequeñas o mal rastreadas) el criterio no se activa, porque entonces
+# "estar cerca de la home" no sería nada excepcional.
+_PERCENTIL_PROFUNDIDAD_ORIGEN = 0.10
+_DIFERENCIA_MINIMA_MEDIANA_PARA_ACTIVAR_PROFUNDIDAD = 1
+
+
+def _elegibilidad_ampliacion_origen(master: pd.DataFrame) -> dict[str, str]:
+    """Devuelve {url_origen: motivo} SOLO para las categorías origen que
+    cumplen una condición claramente EXCEPCIONAL (decisión de negocio:
+    "que no sea una norma, solo casos puntuales y explicados") para
+    poder recibir más de los `max_enlaces_nuevos_por_origen` enlaces
+    nuevos normales, hasta el tope
+    `max_enlaces_nuevos_por_origen_excepcional`:
+
+    - Casi no tiene enlaces salientes propios todavía
+      (`enlaces_salientes_actuales` <= 2): un origen así tiene mucho
+      "hueco" real para enlazar sin saturar la página, así que
+      limitarlo al cupo normal dejaría valor sin aprovechar.
+    - Está en el 10% de categorías con más autoridad interna (más
+      enlaces entrantes ya recibidos): un hub así puede permitirse
+      repartir más enlaces sin diluir su propia relevancia.
+    - (Si se ha subido Search Console) Está en el 10% de categorías con
+      más clics reales en los últimos 28 días: tráfico real demostrado,
+      no solo enlaces internos — misma idea de "autoridad", con prueba
+      de rendimiento de verdad.
+    - (Si el rastreo trae el dato de profundidad) Está en el 10% de
+      categorías más cerca de la home: misma idea que el punto anterior,
+      pero mirando la posición estructural en vez de los enlaces ya
+      contados — útil también cuando el dataset de enlaces es incompleto.
+
+    Cada condición lleva además un umbral mínimo ABSOLUTO (no solo un
+    percentil relativo): si el dataset de enlaces viene casi vacío (p.ej.
+    un crawl sin el export de enlaces internos), todas las categorías
+    tendrían "pocos enlaces salientes" o "pocos entrantes" a la vez, y
+    sin este umbral mínimo la excepción se activaría para el catálogo
+    entero — justo lo contrario de "solo casos puntuales". Lo mismo para
+    profundidad: si todo el catálogo está a la misma distancia (o casi)
+    de la home, no se activa.
+    """
+    motivos: dict[str, str] = {}
+    if master.empty:
+        return motivos
+
+    salientes = master["enlaces_salientes_actuales"]
+    entrantes = master["enlaces_entrantes_actuales"]
+
+    activar_pocos_salientes = salientes.median() >= _MEDIANA_SALIENTES_MINIMA_PARA_ACTIVAR
+    umbral_autoridad = entrantes.quantile(_PERCENTIL_AUTORIDAD_ORIGEN)
+    activar_autoridad = umbral_autoridad >= _PERCENTIL_AUTORIDAD_MINIMO_PARA_ACTIVAR
+
+    clics = master["clics_28d"] if "clics_28d" in master.columns else pd.Series(dtype=float)
+    activar_gsc = False
+    umbral_clics = None
+    if clics.notna().any():
+        umbral_clics = clics.quantile(_PERCENTIL_GSC_ORIGEN)
+        activar_gsc = pd.notna(umbral_clics) and umbral_clics >= _CLICS_MINIMO_PARA_ACTIVAR
+
+    profundidad = master["profundidad"] if "profundidad" in master.columns else pd.Series(dtype=float)
+    activar_profundidad = False
+    umbral_profundidad = None
+    if profundidad.notna().any():
+        umbral_profundidad = profundidad.quantile(_PERCENTIL_PROFUNDIDAD_ORIGEN)
+        mediana_profundidad = profundidad.median()
+        activar_profundidad = (
+            pd.notna(umbral_profundidad)
+            and pd.notna(mediana_profundidad)
+            and (mediana_profundidad - umbral_profundidad)
+            >= _DIFERENCIA_MINIMA_MEDIANA_PARA_ACTIVAR_PROFUNDIDAD
         )
 
-    # Ningún destino (ni popular ni filler) supera el cupo de 8 entrantes.
-    conteo_por_destino = seleccionadas["categoria_destino"].value_counts()
-    assert (conteo_por_destino <= 8).all()
-
-
-def _make_datasets_con_enlaces_previos(
-    salientes_por_url: dict[str, int],
-    entrantes_extra_para: str | None = None,
-    baseline_destinos: bool = True,
-    profundidad_por_url: dict[str, int] | None = None,
-) -> InputDatasets:
-    """Catálogo de 20 categorías destino (todas con volumen y taxonomía
-    homogéneos, para que el score no dependa de nada salvo las señales de
-    origen que se quieren probar) más las categorías origen que se pasen
-    en `salientes_por_url` (cada una con el nº de enlaces salientes
-    propios indicado, construido literalmente con ese nº de enlaces en el
-    dataset de enlaces). Si se indica `entrantes_extra_para`, esa URL
-    concreta recibe además 20 enlaces entrantes de más (para simular alta
-    autoridad interna).
-
-    `baseline_destinos` (True por defecto) añade a las 20 categorías
-    destino un perfil de enlazado propio realista (enlaces salientes Y
-    entrantes de base), para que las estadísticas globales del catálogo
-    (mediana de salientes, percentil 90 de entrantes) que usan las
-    salvaguardas de `_elegibilidad_ampliacion_origen` reflejen un catálogo
-    real -donde cualquier URL es a la vez origen y destino de enlaces,
-    como el de Sklum (mediana salientes=4.0, p90 entrantes=12.0)- y no un
-    catálogo artificial de "sumideros puros" sin enlazado propio. Se pone
-    a False específicamente para simular un catálogo genuinamente pobre en
-    enlaces de principio a fin (p.ej. sin dataset de enlaces subido).
-
-    `profundidad_por_url` (opcional) fija el nº de clics desde la home de
-    las URLs indicadas; el resto del catálogo recibe una profundidad
-    "normal" de 4 (hay variación real, no todo a la misma distancia de la
-    home) para que las salvaguardas de
-    `_elegibilidad_ampliacion_origen` tengan una mediana representativa.
-    Si no se pasa nada, no se incluye la columna (igual que un crawl real
-    que no trae ese dato: la señal de profundidad simplemente no se usa).
-    """
-    destinos = [f"d{i}" for i in range(1, 21)]
-    origenes = list(salientes_por_url.keys())
-    urls = origenes + destinos
-
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    if profundidad_por_url:
-        crawl["profundidad"] = [profundidad_por_url.get(u, 4) for u in urls]
-    volumen = pd.DataFrame(
-        {"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [500] * len(urls)}
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-
-    filas_enlaces = []
-    for origen, n_salientes in salientes_por_url.items():
-        for i in range(n_salientes):
-            # Enlaces salientes "de relleno" hacia destinos que NO son
-            # candidatos del test (usa nombres fuera de d1..d20 para no
-            # interferir con `exclude_existing_links`).
-            filas_enlaces.append(
-                {
-                    "source_url": origen,
-                    "destination_url": f"otro_destino_{origen}_{i}",
-                    "anchor_text": "",
-                    "zona": "Content",
-                }
+    for row in master.itertuples(index=False):
+        if activar_pocos_salientes and pd.notna(row.enlaces_salientes_actuales) and row.enlaces_salientes_actuales <= _MAX_SALIENTES_PARA_AMPLIAR:
+            motivos[row.url] = (
+                f"casi no tiene enlaces salientes propios todavía "
+                f"({int(row.enlaces_salientes_actuales)}, muy por debajo de la media del catálogo): "
+                "le sobra presupuesto de enlazado para asumir más enlaces nuevos sin saturar la página"
             )
-
-    if baseline_destinos:
-        # Perfil de enlazado BASELINE realista para las 20 categorías
-        # destino (d1..d20): ver docstring. Se usan URLs de relleno fuera
-        # de d1..d20 (y de las categorías origen) para no interferir con
-        # el scoring de candidatos del test. El baseline de entrantes (6)
-        # se elige por encima del umbral de la salvaguarda de autoridad
-        # (5) para que un catálogo "normal" no la desactive por sí solo.
-        for destino in destinos:
-            for i in range(4):
-                filas_enlaces.append(
-                    {
-                        "source_url": destino,
-                        "destination_url": f"otro_destino_baseline_{destino}_{i}",
-                        "anchor_text": "",
-                        "zona": "Content",
-                    }
-                )
-            for i in range(6):
-                filas_enlaces.append(
-                    {
-                        "source_url": f"otro_origen_baseline_{destino}_{i}",
-                        "destination_url": destino,
-                        "anchor_text": "",
-                        "zona": "Content",
-                    }
-                )
-
-    if entrantes_extra_para:
-        for i in range(20):
-            filas_enlaces.append(
-                {
-                    "source_url": f"otro_origen_{i}",
-                    "destination_url": entrantes_extra_para,
-                    "anchor_text": "",
-                    "zona": "Content",
-                }
+        elif activar_autoridad and pd.notna(row.enlaces_entrantes_actuales) and row.enlaces_entrantes_actuales >= umbral_autoridad:
+            motivos[row.url] = (
+                f"está entre el 10% de categorías con más autoridad interna del catálogo "
+                f"({int(row.enlaces_entrantes_actuales)} enlaces entrantes propios): "
+                "puede repartir más enlaces sin diluir su propia relevancia"
             )
-    enlaces = pd.DataFrame(
-        filas_enlaces, columns=["source_url", "destination_url", "anchor_text", "zona"]
-    )
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
+        elif (
+            activar_gsc
+            and pd.notna(getattr(row, "clics_28d", None))
+            and row.clics_28d >= umbral_clics
+        ):
+            motivos[row.url] = (
+                f"tiene mucho rendimiento real en Search Console "
+                f"({int(row.clics_28d)} clics en los últimos 28 días, entre el 10% con más "
+                "tráfico del catálogo): autoridad demostrada de verdad, puede repartir más "
+                "enlaces sin diluir su propia relevancia"
+            )
+        elif (
+            activar_profundidad
+            and pd.notna(getattr(row, "profundidad", None))
+            and row.profundidad <= umbral_profundidad
+        ):
+            motivos[row.url] = (
+                f"está entre el 10% de categorías más cerca de la home en la arquitectura "
+                f"de la web ({int(row.profundidad)} clic(s) de distancia): puede repartir "
+                "más enlaces sin diluir su propia relevancia estructural"
+            )
+    return motivos
 
 
-def test_ampliacion_excepcional_por_pocos_enlaces_salientes():
-    """Una categoría origen que casi no tiene enlaces salientes propios
-    (<=2), en un catálogo donde la mediana SÍ es representativa (>=3),
-    puede recibir más de los 5 enlaces normales — hasta el techo
-    excepcional (10) — y la propuesta explica el motivo. Una categoría
-    "normal" del mismo catálogo, con enlaces salientes típicos, NO se
-    amplía aunque tenga exactamente los mismos candidatos disponibles:
-    no es una norma general.
-    """
-    datasets = _make_datasets_con_enlaces_previos(
-        {"o_pocos": 1, "o_normal_a": 4, "o_normal_b": 4, "o_normal_c": 5, "o_normal_d": 4}
-    )
-    resultado = generate_link_proposals(datasets)
-    seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas["categoria_origen"].value_counts()
-
-    assert conteo["o_pocos"] > 5
-    assert conteo["o_normal_a"] == 5
-    assert conteo["o_normal_b"] == 5
-
-    motivo = resultado.loc[
-        resultado["categoria_origen"] == "o_pocos", "motivo_num_enlaces_origen"
-    ].iloc[0]
-    assert "enlaces salientes" in motivo
-
-
-def test_ampliacion_excepcional_por_autoridad_interna():
-    """Una categoría origen con mucha autoridad interna (muy por encima
-    del percentil 90 de enlaces entrantes del catálogo) puede recibir más
-    de los 5 enlaces normales, con el motivo explicado.
-    """
-    datasets = _make_datasets_con_enlaces_previos(
-        {"o_autoridad": 4, "o_normal_a": 4, "o_normal_b": 4, "o_normal_c": 4, "o_normal_d": 4},
-        entrantes_extra_para="o_autoridad",
-    )
-    resultado = generate_link_proposals(datasets)
-    seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas["categoria_origen"].value_counts()
-
-    assert conteo["o_autoridad"] > 5
-    assert conteo["o_normal_a"] == 5
-
-    motivo = resultado.loc[
-        resultado["categoria_origen"] == "o_autoridad", "motivo_num_enlaces_origen"
-    ].iloc[0]
-    assert "autoridad interna" in motivo
-
-
-def test_ampliacion_excepcional_no_se_activa_si_el_catalogo_entero_tiene_pocos_enlaces():
-    """Salvaguarda: si TODO el catálogo tiene pocos enlaces salientes (p.ej.
-    porque no se ha subido un dataset de enlaces representativo), el
-    criterio de "pocos enlaces salientes" NO debe activarse para todas
-    las categorías a la vez — eso convertiría la excepción en norma.
-    Ninguna categoría debe superar el cupo normal de 5 en este caso.
-    """
-    datasets = _make_datasets_con_enlaces_previos(
-        {f"o{i}": 0 for i in range(1, 8)}, baseline_destinos=False
-    )
-    resultado = generate_link_proposals(datasets)
-    seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas["categoria_origen"].value_counts()
-
-    assert (conteo <= 5).all()
-
-
-def test_menos_de_5_enlaces_siempre_lleva_motivo_explicado():
-    """Si una categoría origen se queda por debajo del cupo normal (5),
-    la propuesta debe explicar el motivo concreto: o bien no había
-    suficientes destinos candidatos, o bien los mejores ya habían
-    agotado su cupo de enlaces entrantes con otras categorías mejor
-    puntuadas. Nunca debe quedar en blanco.
-    """
-    # Un grupo aislado pequeño (3 categorías) hace que cualquier origen
-    # de ese grupo tenga, como mucho, 2 candidatos posibles (el resto del
-    # grupo) — menos que el cupo normal de 5, por pura falta de
-    # candidatos, no por reparto.
-    datasets = _make_datasets_con_grupos_aislados()
-    resultado = generate_link_proposals(datasets)
-    seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas.groupby("categoria_origen").size()
-
-    origenes_bf = ["bf1", "bf2"]  # grupo "Black Friday" de solo 2 categorías
-    for origen in origenes_bf:
-        n = conteo.get(origen, 0)
-        assert n < 5
-        motivo = resultado.loc[
-            resultado["categoria_origen"] == origen, "motivo_num_enlaces_origen"
-        ].iloc[0]
-        assert motivo != ""
-        assert "candidata" in motivo
-
-
-def _make_datasets_un_unico_destino_compartido() -> InputDatasets:
-    """9 categorías origen que SOLO tienen una categoría destino candidata
-    en todo el catálogo ("d_shared"). Con el cupo normal de 8 enlaces
-    entrantes nuevos por destino, 8 de las 9 consiguen su enlace y UNA se
-    queda, inevitablemente, con CERO enlaces nuevos (no le queda ningún
-    otro candidato al que recurrir) — el caso más extremo de "menos de 5".
-    """
-    origenes = [f"o{i}" for i in range(1, 10)]
-    urls = origenes + ["d_shared"]
-    # Los orígenes se marcan como "no indexables" para que la salud técnica
-    # los excluya como posibles DESTINOS de los demás orígenes — si no, al
-    # compartir taxonomía cualquier origen sería también un destino válido
-    # para otro origen y "d_shared" dejaría de ser su único candidato real.
-    # La salud técnica solo restringe el lado destino, así que los orígenes
-    # siguen pudiendo actuar con normalidad como origen de sus propios
-    # enlaces.
-    crawl = pd.DataFrame(
-        {
-            "url": urls,
-            "num_productos": [10] * len(urls),
-            "indexable": [False] * len(origenes) + [True],
-        }
-    )
-    volumen = pd.DataFrame(
-        {"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [500] * len(urls)}
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-
-def test_origen_sin_ningun_enlace_seleccionado_tambien_lleva_motivo_explicado():
-    """Regresión: un origen que se queda con CERO enlaces nuevos (el caso
-    extremo de "menos de 5") es el que más necesita una explicación, y sin
-    embargo `_motivos_num_enlaces` solo recorría los orígenes presentes en
-    `seleccionadas` (es decir, con >=1 enlace elegido) — un origen con 0
-    enlaces no tiene ninguna fila con `seleccionada=True`, así que nunca
-    aparecía en ese recorrido y se quedaba con motivo en blanco (este es
-    exactamente el patrón encontrado al probar con datos reales de Sklum:
-    66 categorías origen con 0 enlaces seleccionados, todas con motivo
-    vacío antes de este fix). Aquí se fuerza destino-contención real (8 de
-    9 orígenes consiguen su único candidato posible, 1 se queda sin
-    ninguno) y se comprueba que ese origen también lleva su motivo
-    explicado.
-    """
-    datasets = _make_datasets_un_unico_destino_compartido()
-    resultado = generate_link_proposals(datasets)
-    seleccionadas = resultado[resultado["seleccionada"]]
-
-    origenes = [f"o{i}" for i in range(1, 10)]
-    conteo = seleccionadas["categoria_origen"].value_counts().reindex(origenes, fill_value=0)
-    origenes_sin_enlaces = conteo[conteo == 0].index.tolist()
-    assert len(origenes_sin_enlaces) == 1, (
-        "se esperaba que exactamente 1 de los 9 orígenes se quedara sin "
-        f"ningún enlace (cupo de destino=8); conteo real: {conteo.to_dict()}"
-    )
-
-    origen_sin_enlaces = origenes_sin_enlaces[0]
-    # El origen sigue presente en el resultado (es un candidato válido que
-    # perdió la contienda por el destino, no un candidato descartado).
-    assert (resultado["categoria_origen"] == origen_sin_enlaces).any()
-
-    motivo = resultado.loc[
-        resultado["categoria_origen"] == origen_sin_enlaces, "motivo_num_enlaces_origen"
-    ].iloc[0]
-    assert motivo != ""
-    assert ("agotado" in motivo) or ("candidata" in motivo)
-
-
-def _make_master_profundidad(
-    profundidad_por_url: dict[str, int],
-    n_filler: int = 27,
+def _recortar_bloque_a_lo_relevante(
+    pairs: pd.DataFrame, limites: LimitesPropuesta
 ) -> pd.DataFrame:
-    """Tabla maestra mínima (no pasa por `generate_link_proposals`, prueba
-    `_elegibilidad_ampliacion_origen` de forma aislada) con un catálogo de
-    relleno cuya profundidad se reparte de forma realista (1 a 9 clics de
-    la home, 3 categorías en cada nivel) para que la mediana y el
-    percentil 10 salgan representativos, más las URLs concretas que se
-    pasen en `profundidad_por_url`. Los enlaces salientes (10) y entrantes
-    (1) se fijan iguales para TODAS las filas a propósito, para que los
-    otros dos criterios de ampliación (pocos salientes / muchos
-    entrantes) queden desactivados y no interfieran con lo que se quiere
-    probar aquí.
+    """De todos los pares candidatos ya puntuados de un bloque, se
+    queda solo con lo que de verdad hace falta conservar:
+
+    - Los pendientes de confirmar (para que el equipo los revise).
+    - Los mejores candidatos por score de cada categoría ORIGEN del
+      bloque, con margen de sobra (ver `_margen_candidatos_por_origen`)
+      para que la selección final pueda repartir el presupuesto de
+      enlaces nuevos por destino sin quedarse sin candidatos de reserva.
+    - Los mejores candidatos por score de cada categoría DESTINO del
+      bloque, con su propio margen (ver `_MARGEN_CANDIDATOS_POR_DESTINO`).
+      Sin esto, una categoría destino con score bajo (poco volumen, pocos
+      productos, o que ya tenía muchos enlaces entrantes de partida)
+      puede no estar NUNCA entre los mejores candidatos de NINGÚN origen
+      -los orígenes del mismo grupo de categorías comparten casi el mismo
+      ranking de destinos, dominado por el propio score del destino- y
+      desaparecería aquí mismo, antes incluso de llegar a competir por
+      presupuesto en `_seleccionar_con_presupuesto_destino`. Con esto, al
+      menos conserva candidatos de reserva con los que esa función (y su
+      rescate de mínimo por destino, ver `_rescatar_minimo_destino_por_congestion`)
+      puede garantizarle igualmente al menos 1 enlace entrante nuevo.
+
+    El resto -candidatos válidos que ni de lejos entran en el margen de su
+    origen NI en el de su destino- se descarta aquí mismo. Es la parte que
+    de verdad evita que la propuesta final ocupe O(N²): con un catálogo de
+    miles de URLs, la inmensa mayoría de los pares candidatos son
+    justamente estos. Cada categoría origen vive entera dentro de un único
+    bloque (el reparto en bloques es por origen, nunca al revés), pero una
+    misma categoría DESTINO aparece repartida en TODOS los bloques (cada
+    bloque la cruza contra su porción de orígenes) — por eso el margen por
+    destino se aplica aquí, a nivel de bloque, y cada bloque aporta sus
+    propios mejores candidatos para ese destino; la unión de todos los
+    bloques ya le deja de sobra para la selección final global.
+
+    OJO: la columna `seleccionada` que se rellena aquí es solo una marca
+    provisional para decidir qué conservar en memoria — la selección de
+    verdad (con presupuesto de destino) se recalcula desde cero al final
+    de `generate_link_proposals`, una vez juntados todos los bloques.
     """
-    fillers = [f"f{i}" for i in range(1, n_filler + 1)]
-    depths_fillers = [(i % 9) + 1 for i in range(n_filler)]
-    urls = fillers + list(profundidad_por_url.keys())
-    depths = depths_fillers + list(profundidad_por_url.values())
-    return pd.DataFrame(
-        {
-            "url": urls,
-            "enlaces_salientes_actuales": [10] * len(urls),
-            "enlaces_entrantes_actuales": [1] * len(urls),
-            "profundidad": depths,
-        }
-    )
+    pendiente = pairs["pendiente_confirmar"]
+    margen_origen = _margen_candidatos_por_origen(limites)
+    margen_destino = _MARGEN_CANDIDATOS_POR_DESTINO
+
+    validas = pairs[~pendiente].copy()
+    validas = validas[validas["score"] >= limites.score_minimo]
+
+    por_origen = validas.sort_values(["origen", "score"], ascending=[True, False])
+    por_origen["_orden"] = por_origen.groupby("origen").cumcount()
+    idx_por_origen = por_origen[por_origen["_orden"] < margen_origen].index
+
+    por_destino = validas.sort_values(["destino", "score"], ascending=[True, False])
+    por_destino["_orden"] = por_destino.groupby("destino").cumcount()
+    idx_por_destino = por_destino[por_destino["_orden"] < margen_destino].index
+
+    seleccionadas_idx = idx_por_origen.union(idx_por_destino)
+
+    pairs = pairs.copy()
+    pairs["seleccionada"] = False
+    pairs.loc[seleccionadas_idx, "seleccionada"] = True
+
+    return pairs[pairs["pendiente_confirmar"] | pairs["seleccionada"]]
 
 
-def test_ampliacion_excepcional_por_profundidad_baja():
-    """Una categoría muy cerca de la home (percentil 10 más bajo de
-    profundidad del catálogo, con una mediana representativa) puede
-    recibir más de los 5 enlaces normales por esta vía, igual que por
-    enlaces entrantes — es la misma idea de "autoridad interna", pero
-    mirando la posición estructural en la arquitectura de la web.
+def _seleccionar_con_presupuesto_destino(
+    resultado: pd.DataFrame,
+    limites: LimitesPropuesta,
+    ampliacion_origen: dict[str, str] | None = None,
+) -> tuple[pd.Series, dict[str, int]]:
+    """Selección final de enlaces nuevos, con dos cupos a la vez (además
+    de una tercera pasada de rescate de mínimos, ver
+    `_rescatar_minimo_por_congestion`). Devuelve `(seleccionada,
+    donantes_rescate)`: la serie booleana de siempre, más un recuento de
+    qué orígenes han "donado" un enlace durante el rescate (para que
+    `_motivos_num_enlaces` pueda explicarlo si acaban por debajo de su
+    cupo normal por esta razón).
+
+    - `max_enlaces_nuevos_por_origen`: cuántos enlaces salientes nuevos
+      como mucho por categoría origen, en el caso normal; hasta
+      `max_enlaces_nuevos_por_origen_excepcional` para los orígenes de
+      `ampliacion_origen` (ver `_elegibilidad_ampliacion_origen`).
+    - `max_enlaces_nuevos_por_destino`: cuántos enlaces entrantes NUEVOS
+      como mucho puede acumular una misma categoría destino en esta
+      propuesta (ver `LimitesPropuesta`).
+
+    Reparto POR RONDAS (decisión de negocio: demasiadas categorías se
+    quedaban con menos enlaces de los que les tocaban, no por falta real
+    de candidatos sino por el ORDEN en que se procesaban los pares). En
+    la ronda 1 cada origen compite únicamente por su MEJOR candidato; en
+    la ronda 2, todos los orígenes que aún tengan hueco compiten por su
+    2º mejor candidato; y así sucesivamente hasta el cupo de cada
+    origen. Dentro de cada ronda, si varios orígenes compiten por el
+    mismo destino casi lleno, gana el par con mejor score (empate
+    determinista, no por orden alfabético).
+
+    Esto es deliberadamente distinto de ordenar TODOS los pares por
+    score de forma global: con el orden global, un puñado de orígenes
+    cuyos candidatos con mejor score global agotaban antes el cupo de
+    los destinos más populares dejaban a muchos otros orígenes con menos
+    de su cupo normal de enlaces, aunque SÍ tuvieran candidatos válidos
+    de sobra -simplemente no les había tocado turno a tiempo-. Por
+    rondas, ningún origen se queda atrás en la cola por culpa de
+    candidatos de OTROS orígenes que ni siquiera son su mejor opción:
+    cada uno agota primero sus mejores opciones antes de que nadie entre
+    en las peores.
+
+    Sin el cupo por destino, unas pocas categorías "ganadoras a priori"
+    (mucho volumen, muchos productos, pocos enlaces entrantes de
+    partida...) se llevaban la inmensa mayoría de los enlaces nuevos
+    -algunas repetidas más de 70 veces, como orígenes distintas- mientras
+    cientos de categorías del catálogo se quedaban sin ningún enlace
+    nuevo: un enlazado poco repartido y de baja calidad, justo lo que
+    reportó el usuario al comparar con el script anterior (que sí
+    limitaba cuántos enlaces entrantes nuevos podía recibir cada
+    categoría mediante su columna "En. Obj.").
     """
-    master = _make_master_profundidad({"o_cerca": 1, "o_normal": 5})
-    motivos = _elegibilidad_ampliacion_origen(master)
+    ampliacion_origen = ampliacion_origen or {}
 
-    assert "o_cerca" in motivos
-    assert "profundidad" not in motivos  # (sanity: no es una URL real)
-    assert "cerca de la home" in motivos["o_cerca"]
-    assert "o_normal" not in motivos
+    validas = resultado[~resultado["pendiente_confirmar"]].copy()
+    validas = validas[validas["score"] >= limites.score_minimo]
+    if validas.empty:
+        return pd.Series(False, index=resultado.index), {}
 
-
-def test_ampliacion_excepcional_por_profundidad_no_se_activa_en_catalogo_plano():
-    """Salvaguarda: si todo el catálogo está a la misma distancia de la
-    home (web pequeña o con estructura muy chata), estar "cerca de la
-    home" no es nada excepcional, así que el criterio no debe activarse
-    para nadie.
-    """
-    urls = [f"u{i}" for i in range(1, 21)]
-    master = pd.DataFrame(
-        {
-            "url": urls,
-            "enlaces_salientes_actuales": [10] * len(urls),
-            "enlaces_entrantes_actuales": [1] * len(urls),
-            "profundidad": [2] * len(urls),
-        }
+    validas = validas.sort_values(
+        ["categoria_origen", "score"], ascending=[True, False]
     )
-    motivos = _elegibilidad_ampliacion_origen(master)
-    assert motivos == {}
+    validas["_rango_origen"] = validas.groupby("categoria_origen").cumcount() + 1
 
+    max_origen_normal = limites.max_enlaces_nuevos_por_origen
+    max_origen_excepcional = limites.max_enlaces_nuevos_por_origen_excepcional
+    max_destino = limites.max_enlaces_nuevos_por_destino
+    # OJO: el límite de rondas es cuántos candidatos por origen hay
+    # disponibles como mucho (el margen de `_recortar_bloque_a_lo_relevante`),
+    # NO el cupo de enlaces del origen — un origen tiene que poder seguir
+    # probando candidatos más abajo de su lista (rango 6, 7, 8...) si sus
+    # mejores opciones chocan una y otra vez con destinos ya llenos,
+    # exactamente igual que antes de repartir por rondas. Limitar aquí las
+    # rondas al cupo (5 o 10) dejaría a un origen sin ninguna posibilidad
+    # de completar su cupo en cuanto sus primeras opciones fallasen, por
+    # muchos candidatos válidos que le quedasen más abajo en la lista.
+    max_rango_global = int(validas["_rango_origen"].max())
 
-def test_ampliacion_excepcional_por_profundidad_no_aplica_si_el_crawl_no_trae_el_dato():
-    """Si el rastreo no incluye ninguna columna de profundidad/nivel (el
-    caso normal hoy), el criterio simplemente no se evalúa — no debe
-    fallar ni activarse por accidente con datos ausentes.
-    """
-    urls = [f"u{i}" for i in range(1, 21)]
-    master = pd.DataFrame(
-        {
-            "url": urls,
-            "enlaces_salientes_actuales": [10] * len(urls),
-            "enlaces_entrantes_actuales": [1] * len(urls),
-        }
-    )
-    motivos = _elegibilidad_ampliacion_origen(master)
-    assert motivos == {}
-
-
-def test_ampliacion_excepcional_por_profundidad_de_extremo_a_extremo():
-    """El mismo criterio de profundidad, pero probado a través de
-    `generate_link_proposals` completo (no solo la función aislada), para
-    confirmar que el dato de profundidad viaja correctamente desde el
-    crawl hasta la columna `motivo_num_enlaces_origen` de la propuesta
-    final.
-    """
-    fillers = [f"f{i}" for i in range(1, 28)]
-    depths_fillers = [(i % 9) + 1 for i in range(27)]
-    destinos = [f"d{i}" for i in range(1, 21)]
-    origenes = ["o_cerca", "o_normal"]
-    urls = fillers + origenes + destinos
-    depths = depths_fillers + [1, 5] + [5] * 20
-
-    crawl = pd.DataFrame(
-        {"url": urls, "num_productos": [10] * len(urls), "profundidad": depths}
-    )
-    volumen = pd.DataFrame(
-        {"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [500] * len(urls)}
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    datasets = InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-    resultado = generate_link_proposals(datasets)
-    seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas.groupby("categoria_origen").size()
-
-    assert conteo.get("o_cerca", 0) > 5
-    assert conteo.get("o_normal", 0) == 5
-
-    motivo = resultado.loc[
-        resultado["categoria_origen"] == "o_cerca", "motivo_num_enlaces_origen"
-    ].iloc[0]
-    assert "cerca de la home" in motivo
-
-
-# ---------------------------------------------------------------------------
-# Rendimiento en Search Console como factor de "autoridad" para la
-# ampliación excepcional (decisión de negocio del 1 oct: "si tienen mucho
-# rendimiento en GSC es que tienen autoridad").
-# ---------------------------------------------------------------------------
-
-
-def test_ampliacion_excepcional_por_rendimiento_gsc():
-    """Una categoría con muchos clics reales en Search Console (top 10%
-    del catálogo, con un umbral mínimo representativo) puede recibir más
-    de los 5 enlaces normales, igual que por enlaces entrantes o
-    profundidad — es autoridad demostrada con tráfico real, no solo
-    enlaces internos.
-    """
-    fillers = [f"f{i}" for i in range(1, 28)]
-    # 10..90 clics, repartidos de forma realista (no todo el catálogo a
-    # trivialmente poco tráfico, para que el percentil 90 sea representativo
-    # y supere la salvaguarda mínima absoluta).
-    clics_fillers = [(i % 9 + 1) * 10 for i in range(27)]
-    destinos = [f"d{i}" for i in range(1, 21)]
-    origenes = ["o_rendimiento", "o_normal"]
-    urls = fillers + origenes + destinos
-
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame(
-        {"url": urls, "keyword": [f"kw_{u}" for u in urls], "volumen": [500] * len(urls)}
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    datasets = InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-    # o_rendimiento tiene muchísimos clics reales; o_normal tiene un
-    # tráfico típico (ni rendimiento excepcional ni residual).
-    sc_urls = fillers + origenes
-    sc_clics = clics_fillers + [1000, 50]
-    search_console = pd.DataFrame(
-        {
-            "url": sc_urls,
-            "clics_28d": sc_clics,
-            "impresiones_28d": [c * 20 for c in sc_clics],
-            "posicion_media": [15.0] * len(sc_urls),
-        }
-    )
-
-    resultado = generate_link_proposals(datasets, search_console=search_console)
-    seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas.groupby("categoria_origen").size()
-
-    assert conteo.get("o_rendimiento", 0) > 5
-    assert conteo.get("o_normal", 0) == 5
-
-    motivo = resultado.loc[
-        resultado["categoria_origen"] == "o_rendimiento", "motivo_num_enlaces_origen"
-    ].iloc[0]
-    assert "Search Console" in motivo
-
-
-def test_ampliacion_excepcional_por_gsc_no_se_activa_sin_datos_de_search_console():
-    """Si no se sube Search Console (el caso normal), el criterio de
-    rendimiento simplemente no se evalúa — nunca debe fallar ni activarse
-    por accidente con datos ausentes.
-    """
-    urls = [f"u{i}" for i in range(1, 21)]
-    master = pd.DataFrame(
-        {
-            "url": urls,
-            "enlaces_salientes_actuales": [10] * len(urls),
-            "enlaces_entrantes_actuales": [1] * len(urls),
-        }
-    )
-    motivos = _elegibilidad_ampliacion_origen(master)
-    assert motivos == {}
-
-
-def test_ampliacion_excepcional_por_gsc_no_se_activa_si_el_trafico_es_residual():
-    """Salvaguarda: si todo el catálogo tiene muy pocos clics (p.ej. un
-    export de GSC de un sitio nuevo o con tráfico casi nulo), tener algo
-    más de clics que el resto no es ninguna "autoridad demostrada" real,
-    así que el criterio no se activa.
-    """
-    urls = [f"u{i}" for i in range(1, 21)]
-    master = pd.DataFrame(
-        {
-            "url": urls,
-            "enlaces_salientes_actuales": [10] * len(urls),
-            "enlaces_entrantes_actuales": [1] * len(urls),
-            "clics_28d": [1] * 19 + [5],  # el "mejor" apenas tiene 5 clics
-        }
-    )
-    motivos = _elegibilidad_ampliacion_origen(master)
-    assert motivos == {}
-
-
-# ---------------------------------------------------------------------------
-# Rescate de mínimo por congestión (decisión de negocio del 1 oct: "lo
-# normal es que salgan 5 y solo en casos excepcionales que salgan menos,
-# pero no quiero varias categorías con 1 enlace"). Si un origen tiene
-# candidatos de sobra pero ha perdido todas las rondas frente a otros
-# mejor puntuados, se le garantiza un mínimo "robando" el hueco al
-# ocupante más prescindible de un destino lleno.
-# ---------------------------------------------------------------------------
-
-
-def _fila_validas(rows: dict) -> pd.DataFrame:
-    return pd.DataFrame.from_dict(rows, orient="index")
-
-
-def test_rescate_de_minimo_desaloja_al_ocupante_mas_prescindible():
-    """Un origen con un único enlace seleccionado (y candidatos de sobra)
-    debe llegar al mínimo robando el hueco de un destino lleno — y debe
-    desalojar al ocupante de PEOR score entre los que pueden permitirse
-    perder un enlace sin caer ellos mismos por debajo del mínimo.
-    """
-    rows: dict = {}
-    idx = 0
-
-    def add(origen, destino, score):
-        nonlocal idx
-        rows[idx] = {"categoria_origen": origen, "categoria_destino": destino, "score": score}
-        idx += 1
-        return idx - 1
-
-    seleccionadas_idx = []
     origen_count: dict[str, int] = {}
-    destino_count: dict[str, int] = {"pop": 8, "otro": 1, "otro2": 0}
+    destino_count: dict[str, int] = {}
+    seleccionadas_idx: list = []
 
-    for i in range(1, 9):
-        o = f"o_rico_{i}"
-        r = add(o, "pop", score=0.5 + i * 0.01)
-        seleccionadas_idx.append(r)
-        origen_count[o] = 6
+    for rango in range(1, max_rango_global + 1):
+        candidatos_rango = validas[validas["_rango_origen"] == rango]
+        if candidatos_rango.empty:
+            continue
+        # Dentro de la misma ronda, mejor score primero: si dos orígenes
+        # compiten por el mismo destino casi lleno en esta ronda, gana
+        # el par de mejor encaje.
+        candidatos_rango = candidatos_rango.sort_values("score", ascending=False)
+        for idx, origen, destino in zip(
+            candidatos_rango.index,
+            candidatos_rango["categoria_origen"],
+            candidatos_rango["categoria_destino"],
+        ):
+            cap_origen = (
+                max_origen_excepcional if origen in ampliacion_origen else max_origen_normal
+            )
+            if origen_count.get(origen, 0) >= cap_origen:
+                continue
+            if destino_count.get(destino, 0) >= max_destino:
+                continue
+            seleccionadas_idx.append(idx)
+            origen_count[origen] = origen_count.get(origen, 0) + 1
+            destino_count[destino] = destino_count.get(destino, 0) + 1
 
-    r_otro = add("o_necesitado", "otro", score=0.9)
-    seleccionadas_idx.append(r_otro)
-    origen_count["o_necesitado"] = 1
-    add("o_necesitado", "pop", score=0.95)  # candidato no elegido, destino lleno
-    add("o_necesitado", "otro2", score=0.3)  # candidato no elegido, destino con hueco libre
-
-    validas = _fila_validas(rows)
-    seleccionadas_final, donantes = _rescatar_minimo_por_congestion(
-        validas, origen_count, destino_count, seleccionadas_idx, max_destino=8, max_origen_normal=5
+    seleccionadas_idx, donantes_rescate = _rescatar_minimo_por_congestion(
+        validas, origen_count, destino_count, seleccionadas_idx, max_destino, max_origen_normal
     )
 
-    assert origen_count["o_necesitado"] == _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA
-    # El desalojado tiene que ser el de peor score en "pop" (o_rico_1, 0.51).
-    assert donantes == {"o_rico_1": 1}
-    assert origen_count["o_rico_1"] == 5
-    # Nadie más perdió nada, y "pop" sigue exactamente en su cupo (8).
-    conteo_pop = sum(
-        1 for i in seleccionadas_final if validas.at[i, "categoria_destino"] == "pop"
+    # `_rescatar_minimo_por_congestion` mantiene `origen_count` al día (lo
+    # muta directamente), pero trabaja sobre una COPIA local de
+    # `destino_count` que nunca se devuelve -por diseño, para no acoplar
+    # ambas funciones-, así que aquí puede estar desfasado tras sus
+    # intercambios. Se recalculan ambos recuentos desde cero a partir de
+    # `seleccionadas_idx` (la única fuente de verdad en este punto) antes
+    # de pasárselos al rescate de mínimo por DESTINO.
+    origen_count = validas.loc[seleccionadas_idx, "categoria_origen"].value_counts().to_dict()
+    destino_count = validas.loc[seleccionadas_idx, "categoria_destino"].value_counts().to_dict()
+
+    seleccionadas_idx = _rescatar_minimo_destino_por_congestion(
+        validas,
+        origen_count,
+        destino_count,
+        seleccionadas_idx,
+        max_origen_normal,
+        max_origen_excepcional,
+        ampliacion_origen,
+        max_destino,
     )
-    assert conteo_pop == 8
+
+    # Recalculado fresco sobre `resultado` completo (no solo `validas`):
+    # la última red de seguridad de abajo sí puede añadir índices de filas
+    # `pendiente_confirmar` que quedan fuera de `validas`.
+    origen_count = resultado.loc[seleccionadas_idx, "categoria_origen"].value_counts().to_dict()
+
+    seleccionadas_idx = _rescatar_destinos_en_cero_absoluto(
+        resultado,
+        seleccionadas_idx,
+        origen_count,
+        max_origen_normal,
+        max_origen_excepcional,
+        ampliacion_origen,
+        max_destino,
+    )
+
+    seleccionada = pd.Series(False, index=resultado.index)
+    seleccionada.loc[seleccionadas_idx] = True
+    return seleccionada, donantes_rescate
 
 
-def test_rescate_de_minimo_nunca_crea_una_nueva_victima_por_debajo_del_minimo():
-    """Si NINGÚN ocupante de los destinos candidatos puede permitirse
-    perder un enlace sin caer él mismo por debajo del mínimo, el rescate
-    no debe desalojar a nadie — el origen necesitado se queda como estaba
-    (su motivo ya queda explicado por otra vía, ver
-    `test_menos_de_5_enlaces_siempre_lleva_motivo_explicado`).
+# Mínimo aceptable para un origen que se queda por debajo del cupo normal
+# (decisión de negocio del 1 oct: "lo normal es que salgan 5 y solo en
+# casos excepcionales que salgan menos, pero no quiero varias categorías
+# con 1 solo enlace"). Si un origen tiene de sobra más candidatos válidos
+# de los que finalmente consiguió -es decir, perdió todas las rondas
+# frente a otros orígenes mejor puntuados, no por falta real de
+# destinos- se le garantiza llegar al menos a este mínimo, "robando" el
+# hueco al ocupante MÁS prescindible de un destino lleno (nunca se
+# empuja a nadie por debajo de este mismo mínimo para rescatar a otro).
+_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA = 3
+
+
+def _rescatar_minimo_por_congestion(
+    validas: pd.DataFrame,
+    origen_count: dict[str, int],
+    destino_count: dict[str, int],
+    seleccionadas_idx: list,
+    max_destino: int,
+    max_origen_normal: int,
+) -> tuple[list, dict[str, int]]:
+    """Segunda pasada tras el reparto por rondas: ningún origen con
+    candidatos de sobra se queda con menos de
+    `_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA` enlaces solo por mala suerte de
+    congestión. Para cada origen "necesitado" se recorren sus candidatos
+    no elegidos (en orden de score): si el destino todavía tiene hueco
+    libre, se añade directamente (no debería pasar normalmente -si había
+    hueco, la ronda principal ya lo habría cogido-, pero un rescate
+    anterior puede haber liberado un hueco mientras tanto); si está
+    lleno, se desaloja al ocupante MENOS imprescindible de ESE destino
+    -el de peor score cuyo origen pueda permitirse perder un enlace sin
+    él mismo caer por debajo del mínimo, priorizando desalojar a quien
+    más margen tenga-. Devuelve la lista de índices seleccionados
+    actualizada y un recuento de cuántas veces ha "donado" un enlace cada
+    origen (para que `_motivos_num_enlaces` pueda explicarlo si ese
+    origen acaba, por este motivo, por debajo de su cupo normal).
+
+    El mínimo efectivo nunca supera `max_origen_normal`: si el cupo
+    normal configurado es menor que `_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA`
+    (poco habitual, pero technically posible), el rescate no debe forzar
+    MÁS enlaces de los que el propio cupo normal permite.
     """
-    rows: dict = {}
-    idx = 0
-
-    def add(origen, destino, score):
-        nonlocal idx
-        rows[idx] = {"categoria_origen": origen, "categoria_destino": destino, "score": score}
-        idx += 1
-        return idx - 1
-
-    seleccionadas_idx = []
-    origen_count: dict[str, int] = {}
-    destino_count: dict[str, int] = {"pop": 2}
-
-    # Los 2 ocupantes de "pop" están exactamente en el mínimo (3): no se
-    # les puede quitar nada sin dejarlos a ellos por debajo.
-    for i in range(1, 3):
-        o = f"o_al_minimo_{i}"
-        r = add(o, "pop", score=0.5 + i * 0.01)
-        seleccionadas_idx.append(r)
-        origen_count[o] = _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA
-
-    r_necesitado = add("o_necesitado", "otro", score=0.9)
-    seleccionadas_idx.append(r_necesitado)
-    origen_count["o_necesitado"] = 1
-    add("o_necesitado", "pop", score=0.95)
-
-    validas = _fila_validas(rows)
-    seleccionadas_final, donantes = _rescatar_minimo_por_congestion(
-        validas, origen_count, destino_count, seleccionadas_idx, max_destino=2, max_origen_normal=5
+    minimo = min(_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA, max_origen_normal)
+    n_candidatos_total = validas.groupby("categoria_origen").size()
+    necesitados = sorted(
+        origen
+        for origen, cnt in origen_count.items()
+        if cnt < minimo
+        and n_candidatos_total.get(origen, 0) > cnt
     )
+    if not necesitados:
+        return seleccionadas_idx, {}
 
-    assert donantes == {}
-    assert origen_count["o_necesitado"] == 1  # no se pudo rescatar, y no pasa nada
-    assert origen_count["o_al_minimo_1"] == _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA
-    assert origen_count["o_al_minimo_2"] == _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA
+    validas_por_origen = {
+        origen: grupo.sort_values("score", ascending=False)
+        for origen, grupo in validas.groupby("categoria_origen")
+    }
+
+    seleccionadas_set = set(seleccionadas_idx)
+    destino_count = dict(destino_count)
+    ocupantes_por_destino: dict[str, list] = {}
+    for idx in seleccionadas_idx:
+        destino = validas.at[idx, "categoria_destino"]
+        ocupantes_por_destino.setdefault(destino, []).append(idx)
+
+    donantes_rescate: dict[str, int] = {}
+
+    for origen in necesitados:
+        candidatos = validas_por_origen.get(origen)
+        if candidatos is None:
+            continue
+        for idx, destino in zip(candidatos.index, candidatos["categoria_destino"]):
+            if origen_count.get(origen, 0) >= minimo:
+                break
+            if idx in seleccionadas_set:
+                continue
+            if destino_count.get(destino, 0) < max_destino:
+                # Hueco libre de verdad (p.ej. liberado por un rescate
+                # anterior en esta misma pasada): se añade sin desalojar
+                # a nadie.
+                seleccionadas_set.add(idx)
+                ocupantes_por_destino.setdefault(destino, []).append(idx)
+                destino_count[destino] = destino_count.get(destino, 0) + 1
+                origen_count[origen] = origen_count.get(origen, 0) + 1
+                continue
+            ocupantes = ocupantes_por_destino.get(destino, [])
+            elegibles = [
+                o_idx
+                for o_idx in ocupantes
+                if origen_count.get(validas.at[o_idx, "categoria_origen"], 0) - 1
+                >= minimo
+            ]
+            if not elegibles:
+                # Este destino concreto no se puede liberar sin crear otra
+                # víctima por debajo del mínimo: se prueba el siguiente
+                # candidato de este mismo origen necesitado.
+                continue
+            # Desalojar primero a quien más margen tiene (mayor conteo
+            # actual) y, entre esos, el enlace de peor score de ese destino.
+            elegibles.sort(
+                key=lambda o_idx: (
+                    -origen_count[validas.at[o_idx, "categoria_origen"]],
+                    validas.at[o_idx, "score"],
+                )
+            )
+            desalojado_idx = elegibles[0]
+            origen_desalojado = validas.at[desalojado_idx, "categoria_origen"]
+
+            seleccionadas_set.discard(desalojado_idx)
+            ocupantes_por_destino[destino].remove(desalojado_idx)
+            origen_count[origen_desalojado] = origen_count.get(origen_desalojado, 0) - 1
+            donantes_rescate[origen_desalojado] = donantes_rescate.get(origen_desalojado, 0) + 1
+
+            seleccionadas_set.add(idx)
+            ocupantes_por_destino.setdefault(destino, []).append(idx)
+            origen_count[origen] = origen_count.get(origen, 0) + 1
+
+    return list(seleccionadas_set), donantes_rescate
 
 
-def test_rescate_de_minimo_respeta_un_cupo_normal_configurado_por_debajo_del_minimo():
-    """Si alguien configura `max_enlaces_nuevos_por_origen` por debajo del
-    mínimo habitual (3) -poco común, pero technically posible-, el
-    rescate NUNCA debe forzar más enlaces de los que ese cupo normal
+# Decisión de negocio (1 oct: "todas las categorías tienen que tener, no
+# podemos dejar una categoría sin enlazar"; ajustado el mismo día primero
+# a 4 y después a 2 -"queremos que se siga priorizando búsquedas y
+# productos, etc.": un mínimo demasiado alto diluiría el criterio de
+# scoring, que es el que de verdad decide CUÁNTOS enlaces de más recibe
+# cada categoría por encima de este suelo-): mínimo de enlaces ENTRANTES
+# nuevos para una categoría destino que tenga al menos un candidato
+# técnicamente válido (no bloqueado por grupo aislado, salud técnica,
+# etc. -ver `generate_link_proposals`-). Si el destino no llega a tener 2
+# candidatos válidos en absoluto (catálogos muy pequeños, o un grupo
+# aislado con pocos miembros), se rescata hasta donde haya candidatos
+# -nunca se inventa un enlace que no exista como candidato real-.
+_MINIMO_DESTINO_SI_HAY_CANDIDATOS = 2
+
+
+def _rescatar_minimo_destino_por_congestion(
+    validas: pd.DataFrame,
+    origen_count: dict[str, int],
+    destino_count: dict[str, int],
+    seleccionadas_idx: list,
+    max_origen_normal: int,
+    max_origen_excepcional: int,
+    ampliacion_origen: dict[str, str],
+    max_destino: int,
+) -> list:
+    """Tercera pasada, simétrica a `_rescatar_minimo_por_congestion` pero
+    mirando a quien RECIBE en vez de a quien reparte: ninguna categoría
+    destino con al menos un candidato válido se queda muy por debajo de
+    `_MINIMO_DESTINO_SI_HAY_CANDIDATOS` enlaces entrantes nuevos solo
+    porque, en las rondas normales, perdió la competición por hueco frente
+    a destinos con mejor score en TODOS los orígenes que la tenían como
+    candidata (sin esta pasada, le pasa a aprox. un 30% del catálogo en
+    datos reales de Sklum: categorías con poco volumen, pocos productos o
+    que ya tenían muchos enlaces entrantes de partida pierden siempre esa
+    competición, nunca por falta real de candidatos técnicamente válidos).
+
+    El mínimo EFECTIVO nunca supera `max_destino` (el tope configurado de
+    enlaces entrantes nuevos, ver `LimitesPropuesta.max_enlaces_nuevos_por_destino`):
+    si alguien configura ese tope por debajo del mínimo habitual (poco
+    común, pero technically posible, igual que con el mínimo de origen),
+    el rescate no debe forzar más enlaces de los que el propio tope
     permite.
+
+    Para cada destino necesitado (menos del mínimo efectivo todavía), se
+    recorren sus candidatos no elegidos en orden de score, intentando
+    sumar uno tras otro hasta llegar al mínimo (o agotar candidatos): si
+    el origen de un candidato todavía tiene hueco libre en su propio
+    cupo, se añade directamente (no desaloja a nadie, no cambia el total
+    de enlaces de ese origen). Si el origen ya está al tope, se le
+    desaloja uno de sus enlaces actuales -el de peor score, y solo si
+    apunta a un destino que pueda permitirse perderlo sin caer él mismo
+    por debajo de SU propio mínimo ya garantizado- para hacerle sitio: el
+    total de enlaces de ese origen no cambia (se sustituye un destino por
+    otro).
+
+    Se procesan primero los destinos con MENOS candidatos disponibles
+    (los más difíciles de rescatar), para no agotar huecos "fáciles" en
+    destinos menos urgentes antes de llegar a los que de verdad lo
+    necesitan. Un destino puede quedarse por debajo del mínimo si no
+    tiene tantos candidatos válidos como el mínimo exige, o si ninguno de
+    sus candidatos restantes tiene hueco propio ni un ocupante
+    prescindible que desalojar (infrecuente, y nunca a costa de dejar a
+    otro destino por debajo de ESE mismo mínimo).
     """
-    datasets = _make_datasets()
-    limites = LimitesPropuesta(max_enlaces_nuevos_por_origen=1, score_minimo=0.0)
-    resultado = generate_link_proposals(datasets, limites=limites)
+    minimo = min(_MINIMO_DESTINO_SI_HAY_CANDIDATOS, max_destino)
+    # Decisión de negocio (1 oct): el mínimo garantizado de 2 enlaces NUEVOS
+    # no aplica a Black Friday/Rebajas/Special Price/Navidad — estos grupos
+    # aislados suelen estar ya saturados de enlaces (breadcrumb, bolitas...)
+    # entre sus propios miembros, y forzar un mínimo ahí competiría sin
+    # sentido con categorías de esos mismos grupos que sí tienen hueco real.
+    destinos_aislados = set(
+        validas.loc[
+            validas["grupo_aislado_destino"].fillna("") != "", "categoria_destino"
+        ].unique()
+    ) if "grupo_aislado_destino" in validas.columns else set()
+    necesitados = [
+        destino
+        for destino in validas["categoria_destino"].unique()
+        if destino_count.get(destino, 0) < minimo and destino not in destinos_aislados
+    ]
+    if not necesitados:
+        return seleccionadas_idx
 
-    for origen, grupo in resultado.groupby("categoria_origen"):
-        assert grupo["seleccionada"].sum() <= 1
+    validas_por_destino = {
+        destino: grupo.sort_values("score", ascending=False)
+        for destino, grupo in validas.groupby("categoria_destino")
+    }
+    necesitados.sort(key=lambda d: len(validas_por_destino.get(d, [])))
+
+    seleccionadas_set = set(seleccionadas_idx)
+    ocupantes_por_origen: dict[str, list] = {}
+    for idx in seleccionadas_idx:
+        origen = validas.at[idx, "categoria_origen"]
+        ocupantes_por_origen.setdefault(origen, []).append(idx)
+
+    for destino in necesitados:
+        candidatos = validas_por_destino.get(destino)
+        if candidatos is None or candidatos.empty:
+            continue
+        for idx, origen in zip(candidatos.index, candidatos["categoria_origen"]):
+            if destino_count.get(destino, 0) >= minimo:
+                break
+            if idx in seleccionadas_set:
+                continue
+            cap_origen = (
+                max_origen_excepcional if origen in ampliacion_origen else max_origen_normal
+            )
+            if origen_count.get(origen, 0) < cap_origen:
+                seleccionadas_set.add(idx)
+                ocupantes_por_origen.setdefault(origen, []).append(idx)
+                origen_count[origen] = origen_count.get(origen, 0) + 1
+                destino_count[destino] = destino_count.get(destino, 0) + 1
+                continue
+
+            # El origen ya está al tope: para hacerle sitio sin que supere
+            # su propio cupo, hay que desalojar uno de sus enlaces
+            # actuales -el de peor score, y solo entre los que apuntan a
+            # un destino que TODAVÍA tiene margen por encima de su propio
+            # mínimo ya garantizado (nunca se empuja a nadie por debajo de
+            # su propio mínimo para rescatar a otro)-.
+            ocupantes_origen = ocupantes_por_origen.get(origen, [])
+            elegibles = [
+                o_idx
+                for o_idx in ocupantes_origen
+                if destino_count.get(validas.at[o_idx, "categoria_destino"], 0) > minimo
+            ]
+            if not elegibles:
+                continue
+            elegibles.sort(key=lambda o_idx: validas.at[o_idx, "score"])
+            desalojado_idx = elegibles[0]
+            destino_desalojado = validas.at[desalojado_idx, "categoria_destino"]
+
+            seleccionadas_set.discard(desalojado_idx)
+            ocupantes_por_origen[origen].remove(desalojado_idx)
+            destino_count[destino_desalojado] = destino_count.get(destino_desalojado, 0) - 1
+
+            seleccionadas_set.add(idx)
+            ocupantes_por_origen.setdefault(origen, []).append(idx)
+            destino_count[destino] = destino_count.get(destino, 0) + 1
+
+    return list(seleccionadas_set)
 
 
-def test_rescate_de_minimo_extremo_a_extremo_evita_categorias_con_un_solo_enlace():
-    """El caso real que motivó este cambio: muchos orígenes compiten por
-    los mismos destinos "buenos" y, sin rescate, alguno se queda con un
-    único enlace pese a tener de sobra más candidatos válidos. Con el
-    rescate, ningún origen con candidatos de sobra debe quedarse con
-    menos de `_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA`.
+# Decisión de negocio (1 oct, matizada el mismo día: "quiero dos enlaces
+# entrantes en la PROPUESTA de interlinking: si ya tiene enlaces en
+# breadcrumbs/bolitas eso va aparte, cuenta para el scoring -menos
+# prioridad si ya tiene muchos- pero no para este mínimo"): ninguna
+# categoría puede quedarse con menos de `_MINIMO_DESTINO_SI_HAY_CANDIDATOS`
+# enlaces NUEVOS en la propuesta, cuente o no con enlaces previos
+# (breadcrumb, bolitas, contenido...).
+#
+# Única excepción, también de negocio (1 oct: "podemos hacer excepción con
+# black friday, navidad, rebajas y special price"): los 4 grupos aislados
+# no entran en este mínimo — ya suelen estar saturados de enlaces internos
+# entre sus propios miembros (breadcrumb sobre todo) y forzar un mínimo ahí
+# no aporta nada real.
+#
+# `_rescatar_minimo_destino_por_congestion` (más arriba) ya garantiza el
+# mínimo de enlaces NUEVOS para cualquier destino (no aislado) con al
+# menos un candidato VÁLIDO (`pendiente_confirmar=False`). Pero si a un
+# destino le falta un dato obligatorio (volumen de búsqueda, nº de
+# productos) en TODOS sus candidatos, ese rescate no tiene ningún
+# candidato válido con el que trabajar y el destino se queda en cero
+# enlaces nuevos pese al mínimo.
+def _rescatar_destinos_en_cero_absoluto(
+    resultado: pd.DataFrame,
+    seleccionadas_idx: list,
+    origen_count: dict[str, int],
+    max_origen_normal: int,
+    max_origen_excepcional: int,
+    ampliacion_origen: dict[str, str],
+    max_destino: int,
+) -> list:
+    """Última red de seguridad, tras todos los rescates anteriores: para
+    cualquier categoría destino (que no sea de un grupo aislado) que siga
+    con menos de `_MINIMO_DESTINO_SI_HAY_CANDIDATOS` enlaces NUEVOS
+    seleccionados en esta propuesta, se recurre a sus candidatos
+    PENDIENTES DE CONFIRMAR -nunca a un par que ni siquiera exista como
+    candidato técnico (grupo aislado distinto, auto-enlace, enlace ya
+    existente: esos ya se descartaron mucho antes, al generar los pares
+    candidatos)-, priorizando los de mejor afinidad de categoría (misma
+    categoría/subcategoría primero).
+
+    El enlace así rescatado SIGUE marcado `pendiente_confirmar=True` en la
+    propuesta final (el equipo lo verá señalado con su motivo: qué dato
+    falta por confirmar), pero cuenta como seleccionado y aparece en la
+    propuesta -es preferible un enlace razonable por categoría a falta de
+    confirmar un dato concreto, que dejar la categoría completamente
+    huérfana de enlaces nuevos-.
+
+    Respeta igualmente el cupo de cada origen (`max_enlaces_nuevos_por_origen`,
+    o el excepcional si aplica): nunca se le fuerza a un origen un enlace
+    de más por rescatar a un destino. Si NINGÚN origen candidato de un
+    destino tiene hueco libre en su propio cupo, ese destino puede
+    quedarse por debajo del mínimo pese a esta última red -caso extremo,
+    no esperado en la práctica salvo catálogos muy pequeños o con cupos
+    de origen configurados muy bajos-.
     """
-    # 12 orígenes, todos prefiriendo los mismos 2 destinos "muy buenos"
-    # (cupo 8 cada uno = 16 huecos para 12*5=60 enlaces deseados) y SIN
-    # ningún destino "filler" de refuerzo: sin rescate, varios orígenes se
-    # quedarían con 1-2 enlaces simplemente por perder todas las rondas.
-    buenos = ["bueno1", "bueno2"]
-    origenes = [f"o{i}" for i in range(1, 13)]
-    urls = origenes + buenos
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame(
-        {
-            "url": urls,
-            "keyword": [f"kw_{u}" for u in urls],
-            "volumen": [1000, 990] + [0] * len(origenes),
-        }
-    )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    datasets = InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
+    minimo = min(_MINIMO_DESTINO_SI_HAY_CANDIDATOS, max_destino)
 
-    weights = ScoringWeights(
-        volumen_busqueda=1.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
+    seleccionadas_set = set(seleccionadas_idx)
+    destino_count = (
+        resultado.loc[list(seleccionadas_set), "categoria_destino"].value_counts().to_dict()
+        if seleccionadas_set
+        else {}
     )
-    resultado = generate_link_proposals(datasets, weights=weights)
+
+    todos_los_destinos = resultado["categoria_destino"].drop_duplicates()
+    if "grupo_aislado_destino" in resultado.columns:
+        destinos_aislados = set(
+            resultado.loc[
+                resultado["grupo_aislado_destino"].fillna("") != "", "categoria_destino"
+            ].unique()
+        )
+    else:
+        destinos_aislados = set()
+
+    necesitados = [
+        destino
+        for destino in todos_los_destinos
+        if destino_count.get(destino, 0) < minimo and destino not in destinos_aislados
+    ]
+    if not necesitados:
+        return seleccionadas_idx
+
+    pendientes = resultado[resultado["pendiente_confirmar"]]
+    if pendientes.empty:
+        return seleccionadas_idx
+
+    pendientes_por_destino = {
+        destino: grupo.sort_values(["afinidad", "categoria_origen"], ascending=[False, True])
+        for destino, grupo in pendientes.groupby("categoria_destino")
+    }
+
+    for destino in necesitados:
+        candidatos = pendientes_por_destino.get(destino)
+        if candidatos is None or candidatos.empty:
+            continue
+        for idx, origen in zip(candidatos.index, candidatos["categoria_origen"]):
+            if destino_count.get(destino, 0) >= minimo:
+                break
+            if idx in seleccionadas_set:
+                continue
+            cap_origen = (
+                max_origen_excepcional if origen in ampliacion_origen else max_origen_normal
+            )
+            if origen_count.get(origen, 0) >= cap_origen:
+                continue
+            seleccionadas_set.add(idx)
+            origen_count[origen] = origen_count.get(origen, 0) + 1
+            destino_count[destino] = destino_count.get(destino, 0) + 1
+
+    return list(seleccionadas_set)
+
+
+def _motivos_num_enlaces(
+    resultado: pd.DataFrame,
+    limites: LimitesPropuesta,
+    ampliacion_origen: dict[str, str],
+    donantes_rescate: dict[str, int] | None = None,
+) -> dict[str, str]:
+    """Explica, por categoría origen, por qué tiene MÁS o MENOS enlaces
+    nuevos de los `max_enlaces_nuevos_por_origen` "normales" — nunca en
+    silencio (decisión de negocio: toda desviación del cupo normal, en
+    cualquiera de los dos sentidos, se explica en la propuesta final, ver
+    `build_formato_ancho`). Si un origen se queda exactamente en el cupo
+    normal, no hace falta ninguna explicación (cadena vacía).
+
+    `donantes_rescate` (ver `_rescatar_minimo_por_congestion`) identifica
+    a los orígenes que han "donado" uno de sus enlaces para rescatar a
+    otro origen muy congestionado; si ESO es lo que explica que un origen
+    se quede por debajo del cupo normal (y no la congestión genérica de
+    siempre), se explica así específicamente, con honestidad.
+    """
+    max_normal = limites.max_enlaces_nuevos_por_origen
+    donantes_rescate = donantes_rescate or {}
+
+    validas = resultado[
+        (~resultado["pendiente_confirmar"]) & (resultado["score"] >= limites.score_minimo)
+    ]
+    n_candidatos = validas.groupby("categoria_origen").size()
+
     seleccionadas = resultado[resultado["seleccionada"]]
-    conteo = seleccionadas.groupby("categoria_origen").size().reindex(origenes, fill_value=0)
+    n_seleccionados = seleccionadas.groupby("categoria_origen").size()
 
-    assert (conteo >= _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA).all(), conteo.to_dict()
-
-
-# ---------------------------------------------------------------------------
-# id_origen/id_destino y h1_origen/h1_destino en el resultado (petición del
-# usuario del 1 oct: poder ver el ID y el H1 de cada categoría en la
-# propuesta, no solo la URL completa).
-# ---------------------------------------------------------------------------
-
-
-def _make_datasets_con_urls_realistas() -> InputDatasets:
-    urls = [
-        "https://www.sklum.com/es/524-comprar-mesas-de-salon",
-        "https://www.sklum.com/es/901-comprar-sillas-de-comedor",
-    ]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [50, 40]})
-    volumen = pd.DataFrame({"url": urls, "keyword": ["kw1", "kw2"], "volumen": [500, 300]})
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles", "Muebles"],
-            "categoria_secundaria": ["Salon", "Comedor"],
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
-
-
-def test_derivar_titulo_desde_url_quita_id_y_prefijo_comprar():
-    assert (
-        _derivar_titulo_desde_url("https://www.sklum.com/es/524-comprar-mesas-de-salon")
-        == "Mesas de salon"
-    )
-
-
-def test_derivar_titulo_desde_url_sin_prefijo_comprar_tambien_funciona():
-    assert _derivar_titulo_desde_url("https://www.sklum.com/es/524-mesas-de-salon") == "Mesas de salon"
-
-
-def test_derivar_titulo_desde_url_vacia_devuelve_vacio():
-    assert _derivar_titulo_desde_url(None) == ""
-    assert _derivar_titulo_desde_url("") == ""
+    # OJO: se recorren TODOS los orígenes de la propuesta (no solo los que
+    # tienen algún enlace seleccionado). Un origen que se queda sin NINGÚN
+    # enlace nuevo (0) sigue estando por debajo del cupo normal y por tanto
+    # también necesita su motivo explicado — antes de este fix quedaba en
+    # blanco porque no aparecía en `n_seleccionados` (al no tener ninguna
+    # fila con `seleccionada=True`, `groupby` nunca genera esa clave).
+    motivos: dict[str, str] = {}
+    for origen in resultado["categoria_origen"].unique():
+        n_sel = int(n_seleccionados.get(origen, 0))
+        if n_sel > max_normal:
+            motivos[origen] = ampliacion_origen.get(
+                origen, "cupo ampliado de forma excepcional"
+            )
+        elif n_sel < max_normal:
+            n_cand = int(n_candidatos.get(origen, 0))
+            if n_cand < max_normal:
+                motivos[origen] = (
+                    f"solo hay {n_cand} categoría(s) destino candidata(s) que cumplen los "
+                    "requisitos mínimos para este origen (tras aplicar grupos aislados, "
+                    "salud técnica y enlaces ya existentes)"
+                )
+            elif origen in donantes_rescate:
+                veces = donantes_rescate[origen]
+                minimo_efectivo = min(_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA, max_normal)
+                motivos[origen] = (
+                    f"ha cedido {veces} de sus enlaces nuevos a otra(s) categoría(s) que, sin "
+                    "este ajuste, se habrían quedado con muy pocos (se garantiza un mínimo de "
+                    f"{minimo_efectivo} enlaces a cualquier categoría con candidatos de sobra, "
+                    "para que el reparto sea más justo)"
+                )
+            else:
+                motivos[origen] = (
+                    "los destinos candidatos con mejor encaje ya habían agotado su cupo de "
+                    "enlaces entrantes nuevos con otras categorías de origen mejor puntuadas "
+                    "para ese mismo destino"
+                )
+    return motivos
 
 
-def test_build_master_table_rellena_h1_e_id_cuando_no_hay_h1_real():
-    datasets = _make_datasets_con_urls_realistas()
-    master = build_master_table(datasets).set_index("url")
+def generate_link_proposals(
+    datasets: InputDatasets,
+    weights: ScoringWeights | None = None,
+    affinity: AffinityScores | None = None,
+    limites: LimitesPropuesta | None = None,
+    relevancia_categoria: pd.DataFrame | None = None,
+    prioridad_negocio: pd.DataFrame | None = None,
+    grupos_aislados: list[str] | None = None,
+    search_console: pd.DataFrame | None = None,
+    oportunidad: OportunidadSEO | None = None,
+    contador: dict | None = None,
+) -> pd.DataFrame:
+    """Genera la propuesta de interlinking completa.
 
-    fila = master.loc["https://www.sklum.com/es/524-comprar-mesas-de-salon"]
-    assert fila["id"] == "524"
-    # Sin columna H1 real en el crawl -> se aproxima desde el slug, nunca
-    # queda vacío.
-    assert fila["h1"] == "Mesas de salon"
+    Devuelve UNA tabla con todos los pares (origen, destino) candidatos
+    válidos (sin auto-enlaces, sin enlaces ya existentes y respetando
+    los grupos aislados como Black Friday/Rebajas), cada uno con:
+      - su score (o NaN si está pendiente de confirmar),
+      - el motivo si está pendiente de confirmar,
+      - si ha sido seleccionada dentro del límite de enlaces nuevos por
+        categoría origen (`seleccionada=True`) o no.
 
+    Las filas "pendiente_confirmar" NUNCA se seleccionan automáticamente
+    (no se puede confiar en un score calculado sobre datos incompletos),
+    pero se conservan en la tabla para que el equipo las revise y
+    complete los datos que faltan.
 
-def test_build_master_table_usa_el_h1_real_si_el_crawl_lo_trae():
-    """Si el export del rastreo SÍ trae una columna de H1 real, esa es la
-    que se usa (nunca se sobreescribe con la aproximación del slug)."""
-    datasets = _make_datasets_con_urls_realistas()
-    datasets.crawl["h1"] = ["Mesas de Salón Nórdicas", ""]  # la 2ª URL sigue sin H1 real
-    master = build_master_table(datasets).set_index("url")
+    `grupos_aislados` es una lista de patrones ADICIONALES a los 4
+    obligatorios de `DEFAULT_GRUPOS_AISLADOS` (Black Friday, Rebajas,
+    Special Price y Navidad), que se aplican SIEMPRE pase lo que pase en
+    este parámetro (ver `_combinar_con_grupos_obligatorios`): una categoría
+    que coincide con uno de estos patrones (en su categoría principal o
+    secundaria) SOLO puede enlazar, y ser enlazada, por otras categorías
+    del MISMO patrón. Nunca se mezclan entre grupos distintos, ni con el
+    resto del catálogo. Es una restricción dura de negocio, no configurable
+    a la baja: los pares que la incumplen ni siquiera se generan como
+    candidatos.
 
-    assert master.loc["https://www.sklum.com/es/524-comprar-mesas-de-salon", "h1"] == "Mesas de Salón Nórdicas"
-    # La URL sin H1 real sigue cayendo al título aproximado desde el slug.
-    assert master.loc["https://www.sklum.com/es/901-comprar-sillas-de-comedor", "h1"] == "Sillas de comedor"
-
-
-def test_generate_link_proposals_incluye_id_y_h1_de_origen_y_destino():
-    datasets = _make_datasets_con_urls_realistas()
-    resultado = generate_link_proposals(datasets)
-
-    assert {"id_origen", "id_destino", "h1_origen", "h1_destino"} <= set(resultado.columns)
-    fila = resultado.iloc[0]
-    assert fila["id_origen"] in {"524", "901"}
-    assert fila["id_destino"] in {"524", "901"}
-    assert fila["h1_origen"] in {"Mesas de salon", "Sillas de comedor"}
-
-
-def test_build_formato_ancho_incluye_h1_de_origen_y_de_cada_enlace():
-    datasets = _make_datasets_con_urls_realistas()
-    resultado = generate_link_proposals(datasets)
-    ancho = build_formato_ancho(resultado)
-
-    assert "h1" in ancho.columns
-    assert "linked_h1_1" in ancho.columns
-    fila = ancho.iloc[0]
-    assert fila["h1"] != ""
-    assert fila["linked_h1_1"] != ""
-
-
-# ---------------------------------------------------------------------------
-# build_formato_it: mismo formato exacto que el documento que el equipo pasó
-# a IT en marzo 2025 (hoja "Info a IT"), pero generado desde la propuesta
-# actual en vez de copiarlo/pegarlo a mano.
-# ---------------------------------------------------------------------------
-
-
-def _make_datasets_con_urls_normalizadas() -> InputDatasets:
-    """A diferencia de `_make_datasets_con_urls_realistas` (URLs con
-    'https://www.' incluido a propósito, tal cual las usan los tests que
-    comparten esa fixture), aquí las URLs van SIN protocolo/www -- tal y
-    como quedan de verdad tras pasar por `normalize_url` en el flujo real
-    (carga -> `build_master_table`). `build_formato_it` siempre antepone
-    'https://www.' al mostrar la URL (iguial que el documento de IT de
-    marzo 2025), así que su fixture de pruebas debe partir de una URL ya
-    normalizada o el resultado sale duplicado.
+    `contador`, si se pasa un dict (aunque sea vacío), se rellena con el
+    nº de pares que sobreviven en cada etapa del filtrado (pensado para
+    diagnosticar por qué una propuesta ha salido vacía sin tener que
+    adivinar en qué paso se ha quedado en 0 — ver `diagnosticar_datasets`
+    más abajo). No afecta al resultado devuelto ni al comportamiento si
+    se deja en `None` (el valor por defecto).
     """
-    urls = ["sklum.com/es/524-comprar-mesas-de-salon", "sklum.com/es/901-comprar-sillas-de-comedor"]
-    crawl = pd.DataFrame({"url": urls, "num_productos": [50, 40]})
-    volumen = pd.DataFrame({"url": urls, "keyword": ["kw1", "kw2"], "volumen": [500, 300]})
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles", "Muebles"],
-            "categoria_secundaria": ["Salon", "Comedor"],
+    weights = (weights or ScoringWeights()).normalizados()
+    affinity = affinity or AffinityScores()
+    limites = limites or LimitesPropuesta()
+    oportunidad = oportunidad or OportunidadSEO()
+
+    if contador is not None:
+        contador.update(
+            {
+                "score_minimo_usado": limites.score_minimo,
+                "max_enlaces_nuevos_por_origen_usado": limites.max_enlaces_nuevos_por_origen,
+                "max_enlaces_nuevos_por_destino_usado": limites.max_enlaces_nuevos_por_destino,
+                "pares_antes_de_filtros": 0,
+                "pares_tras_grupo_aislado": 0,
+                "pares_tras_salud_destino": 0,
+                "pares_tras_excluir_enlaces_existentes": 0,
+                "pares_pendientes_confirmar": 0,
+                "pares_validos_con_score": 0,
+                "score_valido_minimo": None,
+                "score_valido_maximo": None,
+                "pares_seleccionados": 0,
+            }
+        )
+
+    master = build_master_table(
+        datasets, relevancia_categoria, prioridad_negocio, grupos_aislados, search_console
+    )
+    if master.empty:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    ampliacion_origen = _elegibilidad_ampliacion_origen(master)
+
+    master["norm_volumen"] = _normalize_min_max(master["volumen"])
+    # Decisión de negocio del 30 sept: cuantos MÁS productos tenga la
+    # categoría destino, más prioridad — antes era al revés (invert=True,
+    # favorecía a las categorías con pocos productos). Interesa reforzar
+    # con enlaces internos a las categorías con más catálogo, no compensar
+    # a las pequeñas.
+    master["norm_muchos_productos"] = _normalize_min_max(master["num_productos"])
+    master["norm_pocos_enlaces"] = _normalize_min_max(
+        master["enlaces_entrantes_actuales"], invert=True
+    )
+    # Autoridad de origen: mismo dato (enlaces entrantes actuales) que
+    # "pocos enlaces entrantes", pero SIN invertir — aquí más enlaces
+    # entrantes propios significa más autoridad que transmitir como
+    # origen, no una carencia que cubrir como destino.
+    master["norm_autoridad"] = _normalize_min_max(master["enlaces_entrantes_actuales"])
+    # Presupuesto de enlaces salientes: cuantos menos tenga ya la
+    # categoría (como origen), más "hueco" le queda para que un enlace
+    # nuevo siga aportando valor real.
+    master["norm_presupuesto_enlaces"] = _normalize_min_max(
+        master["enlaces_salientes_actuales"], invert=True
+    )
+    master["norm_impresiones"] = _normalize_min_max(master["impresiones_28d"])
+    master["posicion_oportunidad"] = master["posicion_media"].map(
+        lambda p: oportunidad_posicion_score(p, oportunidad)
+    )
+
+    # Salud técnica del destino (opcional): si el crawl trae status_code
+    # y/o indexabilidad, se excluyen de raíz como destino las URLs con
+    # status distinto de 200 o no indexables — restricción dura, igual
+    # que los grupos aislados, no una penalización de score. Si no se
+    # aportó ese dato (NaN/None), no se excluye nada.
+    saludable = pd.Series(True, index=master.index)
+    saludable &= ~(master["status_code"].notna() & (master["status_code"] != 200))
+    # OJO: comparar con "==" y no con "is" — cuando la columna "indexable"
+    # no tiene ningún None (todas las filas traen el dato), pandas la
+    # convierte a dtype bool puro y cada valor pasa a ser un
+    # numpy.bool_, para el que `v is False` es SIEMPRE False (no son el
+    # mismo objeto que el `False` de Python) aunque el valor sea
+    # numéricamente falso — con "is" la exclusión no excluiría nada en
+    # ese caso. "==" funciona igual de bien tanto si la columna es
+    # dtype bool puro como si es dtype object con None mezclado (None ==
+    # False se evalúa a False sin lanzar excepción).
+    saludable &= ~(master["indexable"] == False)  # noqa: E712
+    master["destino_saludable"] = saludable
+
+    urls = master["url"].tolist()
+    if len(urls) < 2:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    origen_df = master.add_suffix("_origen").rename(columns={"url_origen": "origen"})
+    destino_df = master.add_suffix("_destino").rename(columns={"url_destino": "destino"})
+
+    # El cruce origen x destino es, por definición, un producto cartesiano
+    # (cada categoría contra todas las demás como posible destino). Con un
+    # catálogo grande esto puede ser muchos millones de pares si se
+    # construye de una sola vez (N² filas en memoria a la vez), que es lo
+    # que hacía que la app se quedara sin memoria con el catálogo real de
+    # Sklum. Para evitarlo, se procesa por bloques de categorías ORIGEN
+    # (cada bloque se cruza contra TODAS las categorías destino, pero solo
+    # `_BATCH_SIZE` orígenes a la vez): el resultado final es exactamente
+    # el mismo (mismas filas, mismo orden tras el sort de más abajo), solo
+    # cambia cuánta memoria hace falta en cada momento.
+    bloques_resultado: list[pd.DataFrame] = []
+    n_origenes = len(origen_df)
+    tamano_bloque = _tamano_bloque_origenes(len(destino_df))
+    for inicio in range(0, n_origenes, tamano_bloque):
+        bloque_origen = origen_df.iloc[inicio : inicio + tamano_bloque]
+        pairs = (
+            bloque_origen.assign(_key=1)
+            .merge(destino_df.assign(_key=1), on="_key")
+            .drop(columns="_key")
+        )
+        if contador is not None:
+            contador["pares_antes_de_filtros"] += len(pairs)
+
+        # Restricción dura de grupos aislados (Black Friday, Rebajas...):
+        # solo se permite el par si origen y destino están en el mismo
+        # grupo (o ambos son categorías "normales", grupo_aislado == "").
+        pairs = pairs[pairs["grupo_aislado_origen"] == pairs["grupo_aislado_destino"]]
+        if contador is not None:
+            contador["pares_tras_grupo_aislado"] += len(pairs)
+        if pairs.empty:
+            continue
+
+        # Restricción dura de salud técnica: nunca se propone como destino
+        # una URL caída, redirigida o no indexable (si ese dato está
+        # disponible).
+        pairs = pairs[pairs["destino_saludable_destino"]]
+        if contador is not None:
+            contador["pares_tras_salud_destino"] += len(pairs)
+        if pairs.empty:
+            continue
+
+        candidate_pairs = pairs[["origen", "destino"]].copy()
+        kept = exclude_existing_links(candidate_pairs, datasets.enlaces)
+        pairs = pairs.merge(kept, on=["origen", "destino"], how="inner")
+        if contador is not None:
+            contador["pares_tras_excluir_enlaces_existentes"] += len(pairs)
+        if pairs.empty:
+            continue
+
+        pairs = _calcular_scores_bloque(pairs, weights, affinity)
+        if contador is not None:
+            pendientes = pairs["pendiente_confirmar"]
+            validos = pairs.loc[~pendientes, "score"]
+            contador["pares_pendientes_confirmar"] += int(pendientes.sum())
+            contador["pares_validos_con_score"] += int((~pendientes).sum())
+            if not validos.empty:
+                bloque_min = float(validos.min())
+                bloque_max = float(validos.max())
+                actual_min = contador["score_valido_minimo"]
+                actual_max = contador["score_valido_maximo"]
+                contador["score_valido_minimo"] = (
+                    bloque_min if actual_min is None else min(actual_min, bloque_min)
+                )
+                contador["score_valido_maximo"] = (
+                    bloque_max if actual_max is None else max(actual_max, bloque_max)
+                )
+        pairs = _recortar_bloque_a_lo_relevante(pairs, limites)
+        # OJO: aquí NO se cuenta todavía "pares_seleccionados" -- la marca
+        # `seleccionada` de este punto es solo provisional (ver docstring
+        # de `_recortar_bloque_a_lo_relevante`); el recuento de verdad se
+        # hace más abajo, una vez calculada la selección final con
+        # presupuesto de destino sobre la tabla completa.
+        if pairs.empty:
+            continue
+        bloques_resultado.append(pairs)
+
+    if not bloques_resultado:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    resultado = pd.concat(bloques_resultado, ignore_index=True)
+
+    resultado = resultado.rename(
+        columns={
+            "origen": "categoria_origen",
+            "destino": "categoria_destino",
         }
     )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    return InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
+
+    resultado["seleccionada"], donantes_rescate = _seleccionar_con_presupuesto_destino(
+        resultado, limites, ampliacion_origen
+    )
+    if contador is not None:
+        contador["pares_seleccionados"] = int(resultado["seleccionada"].sum())
+
+    resultado["motivo_num_enlaces_origen"] = resultado["categoria_origen"].map(
+        _motivos_num_enlaces(resultado, limites, ampliacion_origen, donantes_rescate)
+    ).fillna("")
+
+    resultado = resultado.rename(
+        columns={
+            "volumen_destino": "volumen_destino",
+            "enlaces_entrantes_actuales_destino": "enlaces_entrantes_actuales_destino",
+            "num_productos_destino": "num_productos_destino",
+            "categoria_principal_destino": "categoria_principal_destino",
+            "categoria_secundaria_destino": "categoria_secundaria_destino",
+        }
+    )
+
+    resultado = resultado.sort_values(
+        ["categoria_origen", "score"], ascending=[True, False], na_position="last"
+    )
+
+    return resultado[RESULT_COLUMNS].reset_index(drop=True)
 
 
-def test_build_formato_it_genera_la_sentencia_sql_esperada():
-    datasets = _make_datasets_con_urls_normalizadas()
-    resultado = generate_link_proposals(datasets)
+# ---------------------------------------------------------------------------
+# 4.1) Diagnóstico: por qué la propuesta ha salido vacía (o casi vacía)
+# ---------------------------------------------------------------------------
+#
+# `generate_link_proposals` siempre puede devolver 0 filas si los datos de
+# entrada no encajan entre sí (aunque la carga de cada fichero por
+# separado no haya dado ningún error), y en ese caso el motivo real puede
+# estar en cualquiera de varios sitios: URLs que no cruzan entre datasets,
+# una columna de salud técnica (Status_Code/Indexable) mal detectada que
+# excluye TODAS las URLs como destino, o una taxonomía que no se ha
+# reconocido bien. Esta función recalcula (de forma barata, sin el cruce
+# N² completo) los números clave de cada paso para poder señalar la causa
+# más probable sin tener que examinar el fichero original a mano.
 
-    formato_it = build_formato_it(resultado)
 
-    assert list(formato_it.columns) == [
-        "ID CAT MAIN",
-        "URL",
-        "Identificadores de las categorías, lista 2",
-        "UPDATE",
+def diagnosticar_datasets(
+    datasets: InputDatasets,
+    relevancia_categoria: pd.DataFrame | None = None,
+    prioridad_negocio: pd.DataFrame | None = None,
+    grupos_aislados: list[str] | None = None,
+    search_console: pd.DataFrame | None = None,
+) -> dict:
+    """Devuelve un dict con estadísticas de diagnóstico sobre los 4
+    datasets de entrada, pensado para mostrarse en la interfaz cuando
+    `generate_link_proposals` devuelve una propuesta vacía. Nunca lanza
+    una excepción por sí misma.
+    """
+    diagnostico: dict = {
+        "n_crawl": int(len(datasets.crawl)),
+        "n_volumen": int(len(datasets.volumen)),
+        "n_taxonomia": int(len(datasets.taxonomia)),
+        "n_enlaces": int(len(datasets.enlaces)),
+    }
+
+    urls_crawl = set(datasets.crawl["url"]) if not datasets.crawl.empty else set()
+    urls_volumen = set(datasets.volumen["url"]) if not datasets.volumen.empty else set()
+    urls_taxonomia = set(datasets.taxonomia["url"]) if not datasets.taxonomia.empty else set()
+
+    diagnostico["urls_crawl_con_volumen"] = len(urls_crawl & urls_volumen)
+    diagnostico["urls_crawl_con_taxonomia"] = len(urls_crawl & urls_taxonomia)
+    diagnostico["ejemplo_urls_crawl"] = sorted(urls_crawl)[:5]
+    diagnostico["ejemplo_urls_volumen"] = sorted(urls_volumen)[:5]
+    diagnostico["ejemplo_urls_taxonomia"] = sorted(urls_taxonomia)[:5]
+    diagnostico["ejemplo_urls_crawl_sin_taxonomia"] = sorted(urls_crawl - urls_taxonomia)[:5]
+
+    if len(urls_crawl) < 2:
+        diagnostico["motivo_probable"] = (
+            "El dataset de crawl tiene menos de 2 URLs válidas tras la limpieza "
+            "(o ninguna). Revisa que la columna de URL del fichero no venga "
+            "vacía y que se haya reconocido bien (mira 'ejemplo_urls_crawl')."
+        )
+        return diagnostico
+
+    master = build_master_table(
+        datasets, relevancia_categoria, prioridad_negocio, grupos_aislados, search_console
+    )
+    diagnostico["n_master"] = int(len(master))
+
+    if "status_code" not in master.columns:
+        master["status_code"] = float("nan")
+    if "indexable" not in master.columns:
+        master["indexable"] = None
+
+    saludable = pd.Series(True, index=master.index)
+    saludable &= ~(master["status_code"].notna() & (master["status_code"] != 200))
+    saludable &= ~(master["indexable"] == False)  # noqa: E712
+    diagnostico["n_destino_saludable"] = int(saludable.sum())
+    diagnostico["n_destino_no_saludable"] = int((~saludable).sum())
+    if master["status_code"].notna().any():
+        diagnostico["distribucion_status_code"] = {
+            str(k): int(v) for k, v in master["status_code"].value_counts(dropna=False).items()
+        }
+    if master["indexable"].notna().any():
+        diagnostico["distribucion_indexable"] = {
+            str(k): int(v) for k, v in master["indexable"].value_counts(dropna=False).items()
+        }
+    if "profundidad" in master.columns and master["profundidad"].notna().any():
+        diagnostico["profundidad_disponible"] = True
+        diagnostico["profundidad_mediana_catalogo"] = float(master["profundidad"].median())
+    else:
+        diagnostico["profundidad_disponible"] = False
+
+    # `master` ya trae "grupo_aislado" calculado por `build_master_table`
+    # (con la misma lógica, prioridad de URL incluida) — se reutiliza tal
+    # cual en vez de recalcularlo aquí por segunda vez con una copia
+    # desactualizada de la lógica.
+    grupo_aislado = master["grupo_aislado"]
+    diagnostico["distribucion_grupo_aislado"] = {
+        (k if k else "(normal, sin grupo)"): int(v)
+        for k, v in grupo_aislado.value_counts(dropna=False).items()
+    }
+
+    n_categorias = int(
+        master["categoria_principal"].astype(str).str.strip().replace("", pd.NA).nunique(dropna=True)
+    )
+    diagnostico["n_categorias_principales_distintas"] = n_categorias
+
+    if diagnostico["n_destino_saludable"] < 2:
+        diagnostico["motivo_probable"] = (
+            "Prácticamente ninguna URL queda marcada como 'destino saludable' "
+            "(según las columnas Status_Code/Indexable): revisa esas dos "
+            "columnas en el fichero, es posible que se esté leyendo una "
+            "columna distinta a la esperada (mira 'distribucion_status_code' "
+            "y 'distribucion_indexable')."
+        )
+    elif n_categorias <= 1:
+        diagnostico["motivo_probable"] = (
+            "Todas las URLs comparten la misma categoría principal (o no se "
+            "les ha asignado ninguna): revisa la columna de "
+            "Categoria_Principal del fichero."
+        )
+    elif diagnostico["urls_crawl_con_taxonomia"] == 0:
+        diagnostico["motivo_probable"] = (
+            "Ninguna URL del crawl tiene taxonomía asociada: aunque estén en "
+            "el mismo fichero, puede que la columna de URL usada para "
+            "detectar el crawl no sea la misma que la usada para la "
+            "taxonomía (revisa 'ejemplo_urls_crawl' vs "
+            "'ejemplo_urls_taxonomia')."
+        )
+    else:
+        diagnostico["motivo_probable"] = (
+            "Los filtros básicos (salud técnica, categorías) no descartan "
+            "nada por sí solos: si aun así la propuesta sale vacía, el motivo "
+            "más probable es que todos los pares candidato ya tuvieran un "
+            "enlace existente entre sí (revisa el dataset de enlaces, "
+            "'n_enlaces' arriba) o que el score mínimo configurado sea "
+            "demasiado alto."
+        )
+
+    return diagnostico
+
+
+# ---------------------------------------------------------------------------
+# 5) Formato "ancho" (id + enlaces en columnas) para integraciones externas
+# ---------------------------------------------------------------------------
+
+_ID_SLUG_RE = re.compile(r"(\d+)-")
+
+
+def extraer_id_de_url(url: str | None) -> str:
+    """Extrae el ID numérico del slug de una URL de Sklum, p.ej.
+    'https://www.sklum.com/es/524-comprar-mobiliario' -> '524'. Si la
+    URL no sigue ese patrón (o viene vacía), devuelve "" en vez de
+    lanzar un error, para que una URL atípica no rompa la exportación
+    entera.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    match = _ID_SLUG_RE.match(slug)
+    return match.group(1) if match else ""
+
+
+_PREFIJOS_TITULO_A_QUITAR = ("comprar-",)
+
+
+def _derivar_titulo_desde_url(url: str | None) -> str:
+    """Aproxima un título legible a partir del slug de la URL para las
+    filas sin H1 real (columna opcional, ver `H1_CANDIDATES` en
+    `core.data_loader`): quita el ID numérico del principio y el prefijo
+    "comprar-" si lo hay, y cambia los guiones por espacios.
+
+    OJO: esto NO es el H1 real de la página, es solo una aproximación
+    para poder revisar la propuesta de un vistazo mientras el export del
+    rastreo no incluya esa columna — en cuanto el crawl la traiga, se usa
+    el H1 real y esta función deja de aplicarse a esas filas.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    match = _ID_SLUG_RE.match(slug)
+    if match:
+        slug = slug[match.end():]
+    for prefijo in _PREFIJOS_TITULO_A_QUITAR:
+        if slug.startswith(prefijo):
+            slug = slug[len(prefijo):]
+            break
+    texto = slug.replace("-", " ").replace("_", " ").strip()
+    return texto[:1].upper() + texto[1:] if texto else ""
+
+
+def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
+    """Convierte la propuesta (una fila por par origen-destino) al
+    formato ancho que ya usaba el equipo con el flujo anterior de
+    Sheets/Apps Script: una fila por URL origen, con su "id" (extraído
+    de la URL) y, a continuación, pares linked_id_N / linked_url_N con
+    cada enlace SELECCIONADO (respeta el máximo y el score mínimo ya
+    aplicados en `generate_link_proposals`), ordenados de mayor a menor
+    score. El número de pares de columnas se ajusta automáticamente al
+    mayor nº de enlaces seleccionados que tenga cualquier origen (no
+    viene fijo a 5): si el límite configurado es distinto, cambia solo.
+    """
+    columnas_vacias = [
+        "id",
+        "url",
+        "h1",
+        "categoria_principal",
+        "categoria_secundaria",
+        "n_enlaces",
+        "motivo_num_enlaces",
     ]
-    assert len(formato_it) == 2
+    if resultado is None or resultado.empty or "seleccionada" not in resultado.columns:
+        return pd.DataFrame(columns=columnas_vacias)
 
-    fila_524 = formato_it[formato_it["ID CAT MAIN"] == 524].iloc[0]
-    assert fila_524["URL"] == "https://www.sklum.com/es/524-comprar-mesas-de-salon"
-    assert fila_524["Identificadores de las categorías, lista 2"] == "901"
-    assert fila_524["UPDATE"] == (
-        "UPDATE led_category_shop SET `id_list_two`='901' WHERE  "
-        f"`id_category`=524 AND `id_shop`in ({IT_SHOPS_DEFAULT});"
+    seleccion = resultado[resultado["seleccionada"]].copy()
+    if seleccion.empty:
+        return pd.DataFrame(columns=columnas_vacias)
+
+    seleccion = seleccion.sort_values(
+        ["categoria_origen", "score"], ascending=[True, False], na_position="last"
     )
+    # OJO: pandas no permite que un campo de itertuples empiece por "_"
+    # (lo renombra a algo posicional tipo "_1"), así que aquí la columna
+    # de orden va sin guion bajo — a diferencia de la "_orden" que usa
+    # generate_link_proposals más arriba, que se consume con .loc/boolean
+    # indexing, no con itertuples.
+    seleccion["orden"] = seleccion.groupby("categoria_origen").cumcount() + 1
+    max_enlaces = int(seleccion["orden"].max())
 
-
-def test_build_formato_it_refleja_el_numero_real_de_enlaces_no_siempre_5():
-    """A diferencia del documento de marzo 2025 (siempre 5 IDs por fila),
-    aquí la lista tiene tantos IDs como enlaces se hayan seleccionado de
-    verdad -- mismo escenario que
-    `test_rescate_de_minimo_extremo_a_extremo_evita_categorias_con_un_solo_enlace`
-    (12 orígenes compitiendo por solo 2 destinos "buenos", sin fillers),
-    pero con URLs que llevan un ID numérico para poder pasar por
-    `build_formato_it`."""
-    buenos = ["sklum.com/es/900-bueno-1", "sklum.com/es/901-bueno-2"]
-    origenes = [f"sklum.com/es/{100 + i}-origen-{i}" for i in range(1, 13)]
-    urls = origenes + buenos
-    crawl = pd.DataFrame({"url": urls, "num_productos": [10] * len(urls)})
-    volumen = pd.DataFrame(
-        {
-            "url": urls,
-            "keyword": [f"kw_{u}" for u in urls],
-            "volumen": [0] * len(origenes) + [1000, 990],
+    filas = []
+    for origen, grupo in seleccion.groupby("categoria_origen", sort=False):
+        primera = grupo.iloc[0]
+        fila = {
+            "id": primera.get("id_origen", "") or extraer_id_de_url(origen),
+            "url": origen,
+            "h1": primera.get("h1_origen", ""),
+            "categoria_principal": primera.get("categoria_principal_origen", ""),
+            "categoria_secundaria": primera.get("categoria_secundaria_origen", ""),
+            "n_enlaces": int(len(grupo)),
+            "motivo_num_enlaces": primera.get("motivo_num_enlaces_origen", "") or "",
         }
+        for row in grupo.itertuples(index=False):
+            n = int(row.orden)
+            fila[f"linked_id_{n}"] = getattr(row, "id_destino", "") or extraer_id_de_url(row.categoria_destino)
+            fila[f"linked_url_{n}"] = row.categoria_destino
+            fila[f"linked_h1_{n}"] = getattr(row, "h1_destino", "")
+            fila[f"linked_category_{n}"] = getattr(row, "categoria_principal_destino", "")
+            fila[f"linked_subcategory_{n}"] = getattr(row, "categoria_secundaria_destino", "")
+            score_n = getattr(row, "score", float("nan"))
+            fila[f"linked_score_{n}"] = round(score_n, 3) if pd.notna(score_n) else ""
+            fila[f"justificacion_{n}"] = _justificacion_enlace(row)
+        filas.append(fila)
+
+    columnas = list(columnas_vacias)
+    for n in range(1, max_enlaces + 1):
+        columnas += [
+            f"linked_id_{n}",
+            f"linked_url_{n}",
+            f"linked_h1_{n}",
+            f"linked_category_{n}",
+            f"linked_subcategory_{n}",
+            f"linked_score_{n}",
+            f"justificacion_{n}",
+        ]
+
+    return pd.DataFrame(filas).reindex(columns=columnas)
+
+
+# ---------------------------------------------------------------------------
+# 5.1) Formato "para IT" (SQL listo para ejecutar, mismo formato que el
+# documento que el equipo ya pasaba a IT en marzo 2025)
+# ---------------------------------------------------------------------------
+
+# Lista de `id_shop` (multi-tienda de PrestaShop: distintos idiomas/países
+# de Sklum) que llevaba el documento de marzo 2025. Es un dato de NEGOCIO
+# (qué tiendas existen hoy), no una constante técnica, así que se deja
+# como valor por defecto configurable en vez de fijarlo sin más -- si el
+# equipo añade o retira alguna tienda, basta con pasar `shops` distinto.
+IT_SHOPS_DEFAULT = "11,15,16,17,19,20,23,26,382,383"
+
+FORMATO_IT_COLUMNS = [
+    "ID CAT MAIN",
+    "URL",
+    "Identificadores de las categorías, lista 2",
+    "UPDATE",
+]
+
+
+def build_formato_it(resultado: pd.DataFrame, shops: str = IT_SHOPS_DEFAULT) -> pd.DataFrame:
+    """Convierte la propuesta al formato exacto que el equipo ya pasaba a
+    IT en marzo 2025 (hoja "Info a IT"): una fila por URL origen con su
+    ID de categoría, la lista de IDs destino separados por coma (mismo
+    orden de score que `build_formato_ancho`) y la sentencia SQL ya lista
+    para ejecutar sobre `led_category_shop`.
+
+    Diferencia deliberada con el documento de marzo 2025: aquella lista
+    tenía SIEMPRE exactamente 5 IDs por fila; aquí tiene tantos IDs como
+    enlaces se hayan seleccionado de verdad para esa categoría (de 3 a
+    `max_enlaces_nuevos_por_origen_excepcional`) -- refleja la propuesta
+    real en vez de recortarla por compatibilidad con el formato antiguo.
+    Si el campo `id_list_two` de PrestaShop/la plantilla del front
+    necesitara un nº fijo de huecos, hay que confirmarlo con IT antes de
+    ejecutar el SQL.
+
+    No incluye enlaces manuales a páginas CMS (tipo "cms:1069" en el
+    documento de marzo 2025): esta herramienta solo conoce categorías de
+    producto del rastreo, no páginas de contenido.
+
+    `shops` es la lista de `id_shop` separados por coma que va en el
+    WHERE de cada UPDATE -- por defecto, la misma que ya usaba el equipo
+    en marzo 2025 (`IT_SHOPS_DEFAULT`).
+    """
+    if resultado is None or resultado.empty or "seleccionada" not in resultado.columns:
+        return pd.DataFrame(columns=FORMATO_IT_COLUMNS)
+
+    ancho = build_formato_ancho(resultado)
+    if ancho.empty:
+        return pd.DataFrame(columns=FORMATO_IT_COLUMNS)
+
+    id_cols = sorted(
+        (c for c in ancho.columns if c.startswith("linked_id_")),
+        key=lambda c: int(c.rsplit("_", 1)[-1]),
     )
-    taxonomia = pd.DataFrame(
-        {
-            "url": urls,
-            "categoria_principal": ["Muebles"] * len(urls),
-            "categoria_secundaria": [""] * len(urls),
-        }
-    )
-    enlaces = pd.DataFrame(columns=["source_url", "destination_url", "anchor_text", "zona"])
-    datasets = InputDatasets(crawl=crawl, enlaces=enlaces, volumen=volumen, taxonomia=taxonomia)
 
-    weights = ScoringWeights(
-        volumen_busqueda=1.0,
-        muchos_productos=0.0,
-        pocos_enlaces_entrantes=0.0,
-        afinidad_categoria=0.0,
-    )
-    # Cupo por destino muy ajustado (1) a propósito: con 14 nodos
-    # queriendo 5 enlaces cada uno, la escasez real de huecos fuerza a
-    # que varios se queden por debajo de 5 (nunca por debajo del mínimo
-    # garantizado), en vez de que todos lleguen a 5 usándose unos a otros
-    # de "relleno" sin más.
-    limites = LimitesPropuesta(max_enlaces_nuevos_por_destino=1)
-    resultado = generate_link_proposals(datasets, weights=weights, limites=limites)
-    formato_it = build_formato_it(resultado)
+    filas = []
+    for _, row in ancho.iterrows():
+        ids = [str(row[c]) for c in id_cols if _valor_valido(row[c]) and str(row[c]).strip() != ""]
+        id_main = str(row.get("id", "") or "").strip()
+        if not ids or not id_main:
+            continue
+        lista2 = ",".join(ids)
+        url = str(row.get("url", "") or "")
+        filas.append(
+            {
+                "ID CAT MAIN": int(id_main) if id_main.isdigit() else id_main,
+                "URL": f"https://www.{url}" if url else "",
+                "Identificadores de las categorías, lista 2": lista2,
+                "UPDATE": (
+                    f"UPDATE led_category_shop SET `id_list_two`='{lista2}' WHERE  "
+                    f"`id_category`={id_main} AND `id_shop`in ({shops});"
+                ),
+            }
+        )
 
-    conteos = formato_it["Identificadores de las categorías, lista 2"].str.split(",").apply(len)
-    assert (conteos >= _MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA).all(), conteos.tolist()
-    assert (conteos < 5).any(), "se esperaba que al menos alguna fila tuviera menos de 5 (no todas iguales)"
+    return pd.DataFrame(filas, columns=FORMATO_IT_COLUMNS)
 
 
-def test_build_formato_it_acepta_una_lista_de_tiendas_distinta():
-    datasets = _make_datasets_con_urls_normalizadas()
-    resultado = generate_link_proposals(datasets)
+def _valor_valido(valor) -> bool:
+    """True si `valor` es un dato real (ni None ni NaN). Atajo para no
+    repetir el chequeo típico de pandas en cada regla de
+    `_justificacion_enlace`.
+    """
+    return valor is not None and not (isinstance(valor, float) and pd.isna(valor))
 
-    formato_it = build_formato_it(resultado, shops="11,15")
-    assert "`id_shop`in (11,15);" in formato_it.iloc[0]["UPDATE"]
 
+def _justificacion_enlace(row) -> str:
+    """Explicación breve, en lenguaje llano (no en jerga de scoring), de
+    por qué se propone este enlace en concreto: qué señales concretas
+    (volumen de búsqueda, pocos enlaces entrantes, categoría prioritaria,
+    prioridad de negocio, oportunidad de posicionamiento, misma
+    categoría...) pesaron a favor de ese destino.
 
-def test_build_formato_it_sin_propuesta_devuelve_tabla_vacia_con_columnas():
-    vacio = pd.DataFrame(columns=["categoria_origen", "categoria_destino", "score", "seleccionada"])
-    formato_it = build_formato_it(vacio)
-    assert formato_it.empty
-    assert list(formato_it.columns) == [
-        "ID CAT MAIN",
-        "URL",
-        "Identificadores de las categorías, lista 2",
-        "UPDATE",
-    ]
+    Recibe una fila (namedtuple de `itertuples`) de la propuesta ya
+    calculada por `generate_link_proposals`: usa `getattr(..., None)`
+    para cada señal porque esta función también debe funcionar si se le
+    pasa una tabla con menos columnas (p.ej. en tests, o en una
+    integración externa que no traiga todo `RESULT_COLUMNS`) — en ese
+    caso simplemente omite las razones que no puede comprobar, en vez de
+    fallar.
+    """
+    razones: list[str] = []
+
+    volumen = getattr(row, "volumen_destino", None)
+    if _valor_valido(volumen) and volumen > 0:
+        razones.append(f"la categoría destino tiene volumen de búsqueda ({int(volumen)}/mes)")
+
+    entrantes = getattr(row, "enlaces_entrantes_actuales_destino", None)
+    if _valor_valido(entrantes) and entrantes <= 2:
+        razones.append("todavía tiene pocos enlaces internos apuntándole")
+
+    relevancia = getattr(row, "relevancia_categoria_destino", None)
+    if _valor_valido(relevancia) and relevancia > 0.5:
+        razones.append("está marcada como categoría prioritaria")
+
+    prioridad = getattr(row, "prioridad_negocio_destino", None)
+    if _valor_valido(prioridad) and prioridad > 0:
+        razones.append("tiene prioridad de negocio asignada")
+
+    posicion = getattr(row, "posicion_media_destino", None)
+    if _valor_valido(posicion) and 4 <= posicion <= 20:
+        razones.append(f"está en posición media {posicion:.0f} en Google, en zona de oportunidad")
+
+    principal_o = getattr(row, "categoria_principal_origen", None)
+    principal_d = getattr(row, "categoria_principal_destino", None)
+    if (
+        _valor_valido(principal_o)
+        and _valor_valido(principal_d)
+        and str(principal_o).strip()
+        and str(principal_o).strip().lower() == str(principal_d).strip().lower()
+    ):
+        razones.append("es de la misma categoría que el origen")
+
+    if not razones:
+        score = getattr(row, "score", None)
+        if _valor_valido(score):
+            razones.append(f"mejor encaje disponible según el score combinado ({score:.2f})")
+        else:
+            razones.append("mejor encaje disponible según el score combinado")
+
+    return "; ".join(razones)
