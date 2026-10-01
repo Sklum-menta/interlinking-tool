@@ -116,6 +116,8 @@ def build_master_table(
         master["status_code"] = float("nan")
     if "indexable" not in master.columns:
         master["indexable"] = None
+    if "profundidad" not in master.columns:
+        master["profundidad"] = float("nan")
 
     if not datasets.enlaces.empty:
         entrantes = (
@@ -168,9 +170,18 @@ def build_master_table(
 
     patrones_grupo = _combinar_con_grupos_obligatorios(grupos_aislados)
     master["grupo_aislado"] = master.apply(
-        lambda r: _detectar_grupo_aislado(r["categoria_principal"], r["categoria_secundaria"], patrones_grupo),
+        lambda r: _detectar_grupo_aislado(
+            r["categoria_principal"], r["categoria_secundaria"], patrones_grupo, r["url"]
+        ),
         axis=1,
     )
+
+    master["id"] = master["url"].map(extraer_id_de_url)
+    if "h1" not in master.columns:
+        master["h1"] = ""
+    master["h1"] = master["h1"].fillna("").astype(str).str.strip()
+    sin_h1 = master["h1"] == ""
+    master.loc[sin_h1, "h1"] = master.loc[sin_h1, "url"].map(_derivar_titulo_desde_url)
 
     return master.reset_index(drop=True)
 
@@ -214,21 +225,43 @@ def _detectar_grupo_aislado(
     categoria_principal: str | None,
     categoria_secundaria: str | None,
     patrones: list[str],
+    url: str | None = None,
 ) -> str:
-    """Devuelve el patrón (en minúsculas) que coincide con la categoría
-    principal o secundaria de la URL, o "" si no pertenece a ningún
-    grupo aislado (categoría "normal", sin restricción).
+    """Devuelve el patrón (en minúsculas) que coincide con esta URL, o ""
+    si no pertenece a ningún grupo aislado (categoría "normal", sin
+    restricción).
 
-    Coincidencia por subcadena e insensible a mayúsculas sobre
-    `categoria_principal` + `categoria_secundaria` juntos, para que dé
-    igual que "Black Friday"/"Rebajas" esté como principal, como
-    secundaria, o repartido entre las dos (p.ej. Categoria_Principal=
-    "Precios especiales", Categoria_Secundaria="Black Friday").
+    El SLUG de la URL se mira PRIMERO y manda sobre la categorización
+    manual cuando ambos dan una respuesta distinta: el slug es un hecho
+    técnico (p.ej. "...-black-friday") que no se puede escribir mal en
+    una celda de Excel, mientras que `categoria_secundaria` es un campo
+    rellenado a mano y, revisando el catálogo real, se han encontrado
+    varias categorías de Black Friday / Rebajas etiquetadas por error
+    como "Special Price" (y alguna de Navidad sin etiquetar en absoluto).
+    Si el slug no da ninguna coincidencia, se recurre a
+    `categoria_principal` + `categoria_secundaria` como hasta ahora (para
+    los grupos aislados que el equipo añada a mano y que no sigan ningún
+    patrón de URL concreto).
+
+    Coincidencia por subcadena e insensible a mayúsculas. Cuando una URL
+    coincide con MÁS DE UN patrón a la vez (p.ej. una categoría puntual
+    "especial-price-navidad" o "navidad-black-friday", que existen en el
+    catálogo), se resuelve de forma determinista por el orden de
+    `patrones` (los 4 obligatorios van en el orden Black Friday > Rebajas
+    > Special Price > Navidad) — no hay una respuesta "correcta" única
+    para esos casos límite, así que al menos es siempre la misma.
     """
-    texto = f"{categoria_principal or ''} {categoria_secundaria or ''}".strip().lower()
+    texto_url = str(url or "").lower()
     for patron in patrones:
         p = str(patron).strip().lower()
-        if p and p in texto:
+        p_url = p.replace(" ", "-")
+        if p and (p_url in texto_url or p in texto_url):
+            return p
+
+    texto_manual = f"{categoria_principal or ''} {categoria_secundaria or ''}".strip().lower()
+    for patron in patrones:
+        p = str(patron).strip().lower()
+        if p and p in texto_manual:
             return p
     return ""
 
@@ -396,7 +429,11 @@ def exclude_existing_links(
 
 RESULT_COLUMNS = [
     "categoria_origen",
+    "id_origen",
+    "h1_origen",
     "categoria_destino",
+    "id_destino",
+    "h1_destino",
     "score",
     "keyword_destino",
     "volumen_destino",
@@ -407,6 +444,7 @@ RESULT_COLUMNS = [
     "categoria_secundaria_destino",
     "enlaces_entrantes_actuales_destino",
     "enlaces_salientes_actuales_origen",
+    "profundidad_origen",
     "num_productos_destino",
     "relevancia_categoria_destino",
     "prioridad_negocio_destino",
@@ -416,6 +454,7 @@ RESULT_COLUMNS = [
     "pendiente_confirmar",
     "motivo_pendiente",
     "seleccionada",
+    "motivo_num_enlaces_origen",
 ]
 
 
@@ -537,16 +576,150 @@ def _margen_candidatos_por_origen(limites: LimitesPropuesta) -> int:
     la selección final con presupuesto de destino (ver
     `_recortar_bloque_a_lo_relevante` y `_seleccionar_con_presupuesto_destino`).
 
-    Tiene que ser mayor que `max_enlaces_nuevos_por_origen`: si el destino
-    mejor puntuado de un origen ya ha agotado su cupo de enlaces nuevos
-    (`max_enlaces_nuevos_por_destino`) porque otros orígenes lo eligieron
-    antes, hace falta tener a mano el siguiente mejor candidato de ESE
-    origen para poder sustituirlo — si solo guardásemos el top 5 "a
-    secas" (como antes de repartir por destino), ese origen se quedaría
-    con menos enlaces de los que le tocan en vez de pasar al siguiente
-    candidato válido.
+    Tiene que ser mayor que el cupo máximo posible por origen (el
+    excepcional, no el normal: ver `LimitesPropuesta.max_enlaces_nuevos_por_origen_excepcional`):
+    si el destino mejor puntuado de un origen ya ha agotado su cupo de
+    enlaces nuevos (`max_enlaces_nuevos_por_destino`) porque otros
+    orígenes lo eligieron antes, hace falta tener a mano el siguiente
+    mejor candidato de ESE origen para poder sustituirlo — si solo
+    guardásemos el top "a secas" (como antes de repartir por destino),
+    ese origen se quedaría con menos enlaces de los que le tocan en vez
+    de pasar al siguiente candidato válido.
     """
-    return max(limites.max_enlaces_nuevos_por_origen * 10, 50)
+    return max(limites.max_enlaces_nuevos_por_origen_excepcional * 10, 50)
+
+
+# Umbrales mínimos (absolutos, no solo relativos) para que los criterios
+# de ampliación excepcional de abajo no se activen "para todo el
+# catálogo a la vez" cuando los datos de enlaces internos son escasos o
+# vienen casi vacíos — ver `_elegibilidad_ampliacion_origen`.
+_MEDIANA_SALIENTES_MINIMA_PARA_ACTIVAR = 3
+_PERCENTIL_AUTORIDAD_MINIMO_PARA_ACTIVAR = 5
+_PERCENTIL_AUTORIDAD_ORIGEN = 0.9
+_MAX_SALIENTES_PARA_AMPLIAR = 2
+
+# Rendimiento real en Search Console (opcional, requiere subir el export
+# de GSC): una categoría con muchos clics en los últimos 28 días ya ha
+# demostrado tener autoridad/relevancia de verdad para el usuario final,
+# no solo "sobre el papel" vía enlaces internos — decisión de negocio del
+# 1 oct ("si tienen mucho rendimiento en GSC es que tienen autoridad").
+# Misma salvaguarda que las demás: si casi nadie tiene datos de GSC o el
+# tráfico es residual en todo el catálogo, no se activa.
+_PERCENTIL_GSC_ORIGEN = 0.9
+_CLICS_MINIMO_PARA_ACTIVAR = 20
+
+# Profundidad de rastreo (opcional, ver `core.data_loader.PROFUNDIDAD_CANDIDATES`):
+# una categoría muy cerca de la home (percentil 10 más bajo de profundidad
+# del catálogo) se considera también "mucha autoridad interna" estructural,
+# igual que tener muchos enlaces entrantes -es, de hecho, la señal de
+# autoridad interna más estándar en SEO, y no depende de que el dataset de
+# enlaces esté completo-. Salvaguarda equivalente a la de enlaces entrantes:
+# si el catálogo entero es "plano" (todo a 1-2 clics de la home, típico de
+# webs pequeñas o mal rastreadas) el criterio no se activa, porque entonces
+# "estar cerca de la home" no sería nada excepcional.
+_PERCENTIL_PROFUNDIDAD_ORIGEN = 0.10
+_DIFERENCIA_MINIMA_MEDIANA_PARA_ACTIVAR_PROFUNDIDAD = 1
+
+
+def _elegibilidad_ampliacion_origen(master: pd.DataFrame) -> dict[str, str]:
+    """Devuelve {url_origen: motivo} SOLO para las categorías origen que
+    cumplen una condición claramente EXCEPCIONAL (decisión de negocio:
+    "que no sea una norma, solo casos puntuales y explicados") para
+    poder recibir más de los `max_enlaces_nuevos_por_origen` enlaces
+    nuevos normales, hasta el tope
+    `max_enlaces_nuevos_por_origen_excepcional`:
+
+    - Casi no tiene enlaces salientes propios todavía
+      (`enlaces_salientes_actuales` <= 2): un origen así tiene mucho
+      "hueco" real para enlazar sin saturar la página, así que
+      limitarlo al cupo normal dejaría valor sin aprovechar.
+    - Está en el 10% de categorías con más autoridad interna (más
+      enlaces entrantes ya recibidos): un hub así puede permitirse
+      repartir más enlaces sin diluir su propia relevancia.
+    - (Si se ha subido Search Console) Está en el 10% de categorías con
+      más clics reales en los últimos 28 días: tráfico real demostrado,
+      no solo enlaces internos — misma idea de "autoridad", con prueba
+      de rendimiento de verdad.
+    - (Si el rastreo trae el dato de profundidad) Está en el 10% de
+      categorías más cerca de la home: misma idea que el punto anterior,
+      pero mirando la posición estructural en vez de los enlaces ya
+      contados — útil también cuando el dataset de enlaces es incompleto.
+
+    Cada condición lleva además un umbral mínimo ABSOLUTO (no solo un
+    percentil relativo): si el dataset de enlaces viene casi vacío (p.ej.
+    un crawl sin el export de enlaces internos), todas las categorías
+    tendrían "pocos enlaces salientes" o "pocos entrantes" a la vez, y
+    sin este umbral mínimo la excepción se activaría para el catálogo
+    entero — justo lo contrario de "solo casos puntuales". Lo mismo para
+    profundidad: si todo el catálogo está a la misma distancia (o casi)
+    de la home, no se activa.
+    """
+    motivos: dict[str, str] = {}
+    if master.empty:
+        return motivos
+
+    salientes = master["enlaces_salientes_actuales"]
+    entrantes = master["enlaces_entrantes_actuales"]
+
+    activar_pocos_salientes = salientes.median() >= _MEDIANA_SALIENTES_MINIMA_PARA_ACTIVAR
+    umbral_autoridad = entrantes.quantile(_PERCENTIL_AUTORIDAD_ORIGEN)
+    activar_autoridad = umbral_autoridad >= _PERCENTIL_AUTORIDAD_MINIMO_PARA_ACTIVAR
+
+    clics = master["clics_28d"] if "clics_28d" in master.columns else pd.Series(dtype=float)
+    activar_gsc = False
+    umbral_clics = None
+    if clics.notna().any():
+        umbral_clics = clics.quantile(_PERCENTIL_GSC_ORIGEN)
+        activar_gsc = pd.notna(umbral_clics) and umbral_clics >= _CLICS_MINIMO_PARA_ACTIVAR
+
+    profundidad = master["profundidad"] if "profundidad" in master.columns else pd.Series(dtype=float)
+    activar_profundidad = False
+    umbral_profundidad = None
+    if profundidad.notna().any():
+        umbral_profundidad = profundidad.quantile(_PERCENTIL_PROFUNDIDAD_ORIGEN)
+        mediana_profundidad = profundidad.median()
+        activar_profundidad = (
+            pd.notna(umbral_profundidad)
+            and pd.notna(mediana_profundidad)
+            and (mediana_profundidad - umbral_profundidad)
+            >= _DIFERENCIA_MINIMA_MEDIANA_PARA_ACTIVAR_PROFUNDIDAD
+        )
+
+    for row in master.itertuples(index=False):
+        if activar_pocos_salientes and pd.notna(row.enlaces_salientes_actuales) and row.enlaces_salientes_actuales <= _MAX_SALIENTES_PARA_AMPLIAR:
+            motivos[row.url] = (
+                f"casi no tiene enlaces salientes propios todavía "
+                f"({int(row.enlaces_salientes_actuales)}, muy por debajo de la media del catálogo): "
+                "le sobra presupuesto de enlazado para asumir más enlaces nuevos sin saturar la página"
+            )
+        elif activar_autoridad and pd.notna(row.enlaces_entrantes_actuales) and row.enlaces_entrantes_actuales >= umbral_autoridad:
+            motivos[row.url] = (
+                f"está entre el 10% de categorías con más autoridad interna del catálogo "
+                f"({int(row.enlaces_entrantes_actuales)} enlaces entrantes propios): "
+                "puede repartir más enlaces sin diluir su propia relevancia"
+            )
+        elif (
+            activar_gsc
+            and pd.notna(getattr(row, "clics_28d", None))
+            and row.clics_28d >= umbral_clics
+        ):
+            motivos[row.url] = (
+                f"tiene mucho rendimiento real en Search Console "
+                f"({int(row.clics_28d)} clics en los últimos 28 días, entre el 10% con más "
+                "tráfico del catálogo): autoridad demostrada de verdad, puede repartir más "
+                "enlaces sin diluir su propia relevancia"
+            )
+        elif (
+            activar_profundidad
+            and pd.notna(getattr(row, "profundidad", None))
+            and row.profundidad <= umbral_profundidad
+        ):
+            motivos[row.url] = (
+                f"está entre el 10% de categorías más cerca de la home en la arquitectura "
+                f"de la web ({int(row.profundidad)} clic(s) de distancia): puede repartir "
+                "más enlaces sin diluir su propia relevancia estructural"
+            )
+    return motivos
 
 
 def _recortar_bloque_a_lo_relevante(
@@ -593,25 +766,46 @@ def _recortar_bloque_a_lo_relevante(
 
 
 def _seleccionar_con_presupuesto_destino(
-    resultado: pd.DataFrame, limites: LimitesPropuesta
-) -> pd.Series:
-    """Selección final de enlaces nuevos, con dos cupos a la vez:
+    resultado: pd.DataFrame,
+    limites: LimitesPropuesta,
+    ampliacion_origen: dict[str, str] | None = None,
+) -> tuple[pd.Series, dict[str, int]]:
+    """Selección final de enlaces nuevos, con dos cupos a la vez (además
+    de una tercera pasada de rescate de mínimos, ver
+    `_rescatar_minimo_por_congestion`). Devuelve `(seleccionada,
+    donantes_rescate)`: la serie booleana de siempre, más un recuento de
+    qué orígenes han "donado" un enlace durante el rescate (para que
+    `_motivos_num_enlaces` pueda explicarlo si acaban por debajo de su
+    cupo normal por esta razón).
 
     - `max_enlaces_nuevos_por_origen`: cuántos enlaces salientes nuevos
-      como mucho por categoría origen (ya existía).
+      como mucho por categoría origen, en el caso normal; hasta
+      `max_enlaces_nuevos_por_origen_excepcional` para los orígenes de
+      `ampliacion_origen` (ver `_elegibilidad_ampliacion_origen`).
     - `max_enlaces_nuevos_por_destino`: cuántos enlaces entrantes NUEVOS
       como mucho puede acumular una misma categoría destino en esta
-      propuesta (nuevo — ver `LimitesPropuesta`).
+      propuesta (ver `LimitesPropuesta`).
 
-    Se recorren TODOS los pares válidos (no pendientes) ordenados de
-    mejor a peor score, de forma GLOBAL (no origen por origen), y se
-    acepta cada uno si su origen y su destino todavía tienen hueco en su
-    cupo respectivo. Procesar por score global en vez de por orden de
-    origen es importante: cuando dos orígenes compiten por el mismo
-    destino ya casi lleno, gana el par con mejor score, no el que
-    "llegó antes" por casualidad del orden alfabético de las URLs — así
-    la selección es determinista y no depende de cómo vengan ordenadas
-    las filas.
+    Reparto POR RONDAS (decisión de negocio: demasiadas categorías se
+    quedaban con menos enlaces de los que les tocaban, no por falta real
+    de candidatos sino por el ORDEN en que se procesaban los pares). En
+    la ronda 1 cada origen compite únicamente por su MEJOR candidato; en
+    la ronda 2, todos los orígenes que aún tengan hueco compiten por su
+    2º mejor candidato; y así sucesivamente hasta el cupo de cada
+    origen. Dentro de cada ronda, si varios orígenes compiten por el
+    mismo destino casi lleno, gana el par con mejor score (empate
+    determinista, no por orden alfabético).
+
+    Esto es deliberadamente distinto de ordenar TODOS los pares por
+    score de forma global: con el orden global, un puñado de orígenes
+    cuyos candidatos con mejor score global agotaban antes el cupo de
+    los destinos más populares dejaban a muchos otros orígenes con menos
+    de su cupo normal de enlaces, aunque SÍ tuvieran candidatos válidos
+    de sobra -simplemente no les había tocado turno a tiempo-. Por
+    rondas, ningún origen se queda atrás en la cola por culpa de
+    candidatos de OTROS orígenes que ni siquiera son su mejor opción:
+    cada uno agota primero sus mejores opciones antes de que nadie entre
+    en las peores.
 
     Sin el cupo por destino, unas pocas categorías "ganadoras a priori"
     (mucho volumen, muchos productos, pocos enlaces entrantes de
@@ -623,29 +817,255 @@ def _seleccionar_con_presupuesto_destino(
     limitaba cuántos enlaces entrantes nuevos podía recibir cada
     categoría mediante su columna "En. Obj.").
     """
+    ampliacion_origen = ampliacion_origen or {}
+
     validas = resultado[~resultado["pendiente_confirmar"]].copy()
     validas = validas[validas["score"] >= limites.score_minimo]
-    validas = validas.sort_values("score", ascending=False)
+    if validas.empty:
+        return pd.Series(False, index=resultado.index), {}
+
+    validas = validas.sort_values(
+        ["categoria_origen", "score"], ascending=[True, False]
+    )
+    validas["_rango_origen"] = validas.groupby("categoria_origen").cumcount() + 1
+
+    max_origen_normal = limites.max_enlaces_nuevos_por_origen
+    max_origen_excepcional = limites.max_enlaces_nuevos_por_origen_excepcional
+    max_destino = limites.max_enlaces_nuevos_por_destino
+    # OJO: el límite de rondas es cuántos candidatos por origen hay
+    # disponibles como mucho (el margen de `_recortar_bloque_a_lo_relevante`),
+    # NO el cupo de enlaces del origen — un origen tiene que poder seguir
+    # probando candidatos más abajo de su lista (rango 6, 7, 8...) si sus
+    # mejores opciones chocan una y otra vez con destinos ya llenos,
+    # exactamente igual que antes de repartir por rondas. Limitar aquí las
+    # rondas al cupo (5 o 10) dejaría a un origen sin ninguna posibilidad
+    # de completar su cupo en cuanto sus primeras opciones fallasen, por
+    # muchos candidatos válidos que le quedasen más abajo en la lista.
+    max_rango_global = int(validas["_rango_origen"].max())
 
     origen_count: dict[str, int] = {}
     destino_count: dict[str, int] = {}
-    seleccionadas_idx = []
-    max_origen = limites.max_enlaces_nuevos_por_origen
-    max_destino = limites.max_enlaces_nuevos_por_destino
-    for idx, origen, destino in zip(
-        validas.index, validas["categoria_origen"], validas["categoria_destino"]
-    ):
-        if origen_count.get(origen, 0) >= max_origen:
+    seleccionadas_idx: list = []
+
+    for rango in range(1, max_rango_global + 1):
+        candidatos_rango = validas[validas["_rango_origen"] == rango]
+        if candidatos_rango.empty:
             continue
-        if destino_count.get(destino, 0) >= max_destino:
-            continue
-        seleccionadas_idx.append(idx)
-        origen_count[origen] = origen_count.get(origen, 0) + 1
-        destino_count[destino] = destino_count.get(destino, 0) + 1
+        # Dentro de la misma ronda, mejor score primero: si dos orígenes
+        # compiten por el mismo destino casi lleno en esta ronda, gana
+        # el par de mejor encaje.
+        candidatos_rango = candidatos_rango.sort_values("score", ascending=False)
+        for idx, origen, destino in zip(
+            candidatos_rango.index,
+            candidatos_rango["categoria_origen"],
+            candidatos_rango["categoria_destino"],
+        ):
+            cap_origen = (
+                max_origen_excepcional if origen in ampliacion_origen else max_origen_normal
+            )
+            if origen_count.get(origen, 0) >= cap_origen:
+                continue
+            if destino_count.get(destino, 0) >= max_destino:
+                continue
+            seleccionadas_idx.append(idx)
+            origen_count[origen] = origen_count.get(origen, 0) + 1
+            destino_count[destino] = destino_count.get(destino, 0) + 1
+
+    seleccionadas_idx, donantes_rescate = _rescatar_minimo_por_congestion(
+        validas, origen_count, destino_count, seleccionadas_idx, max_destino, max_origen_normal
+    )
 
     seleccionada = pd.Series(False, index=resultado.index)
     seleccionada.loc[seleccionadas_idx] = True
-    return seleccionada
+    return seleccionada, donantes_rescate
+
+
+# Mínimo aceptable para un origen que se queda por debajo del cupo normal
+# (decisión de negocio del 1 oct: "lo normal es que salgan 5 y solo en
+# casos excepcionales que salgan menos, pero no quiero varias categorías
+# con 1 solo enlace"). Si un origen tiene de sobra más candidatos válidos
+# de los que finalmente consiguió -es decir, perdió todas las rondas
+# frente a otros orígenes mejor puntuados, no por falta real de
+# destinos- se le garantiza llegar al menos a este mínimo, "robando" el
+# hueco al ocupante MÁS prescindible de un destino lleno (nunca se
+# empuja a nadie por debajo de este mismo mínimo para rescatar a otro).
+_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA = 3
+
+
+def _rescatar_minimo_por_congestion(
+    validas: pd.DataFrame,
+    origen_count: dict[str, int],
+    destino_count: dict[str, int],
+    seleccionadas_idx: list,
+    max_destino: int,
+    max_origen_normal: int,
+) -> tuple[list, dict[str, int]]:
+    """Segunda pasada tras el reparto por rondas: ningún origen con
+    candidatos de sobra se queda con menos de
+    `_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA` enlaces solo por mala suerte de
+    congestión. Para cada origen "necesitado" se recorren sus candidatos
+    no elegidos (en orden de score): si el destino todavía tiene hueco
+    libre, se añade directamente (no debería pasar normalmente -si había
+    hueco, la ronda principal ya lo habría cogido-, pero un rescate
+    anterior puede haber liberado un hueco mientras tanto); si está
+    lleno, se desaloja al ocupante MENOS imprescindible de ESE destino
+    -el de peor score cuyo origen pueda permitirse perder un enlace sin
+    él mismo caer por debajo del mínimo, priorizando desalojar a quien
+    más margen tenga-. Devuelve la lista de índices seleccionados
+    actualizada y un recuento de cuántas veces ha "donado" un enlace cada
+    origen (para que `_motivos_num_enlaces` pueda explicarlo si ese
+    origen acaba, por este motivo, por debajo de su cupo normal).
+
+    El mínimo efectivo nunca supera `max_origen_normal`: si el cupo
+    normal configurado es menor que `_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA`
+    (poco habitual, pero technically posible), el rescate no debe forzar
+    MÁS enlaces de los que el propio cupo normal permite.
+    """
+    minimo = min(_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA, max_origen_normal)
+    n_candidatos_total = validas.groupby("categoria_origen").size()
+    necesitados = sorted(
+        origen
+        for origen, cnt in origen_count.items()
+        if cnt < minimo
+        and n_candidatos_total.get(origen, 0) > cnt
+    )
+    if not necesitados:
+        return seleccionadas_idx, {}
+
+    validas_por_origen = {
+        origen: grupo.sort_values("score", ascending=False)
+        for origen, grupo in validas.groupby("categoria_origen")
+    }
+
+    seleccionadas_set = set(seleccionadas_idx)
+    destino_count = dict(destino_count)
+    ocupantes_por_destino: dict[str, list] = {}
+    for idx in seleccionadas_idx:
+        destino = validas.at[idx, "categoria_destino"]
+        ocupantes_por_destino.setdefault(destino, []).append(idx)
+
+    donantes_rescate: dict[str, int] = {}
+
+    for origen in necesitados:
+        candidatos = validas_por_origen.get(origen)
+        if candidatos is None:
+            continue
+        for idx, destino in zip(candidatos.index, candidatos["categoria_destino"]):
+            if origen_count.get(origen, 0) >= minimo:
+                break
+            if idx in seleccionadas_set:
+                continue
+            if destino_count.get(destino, 0) < max_destino:
+                # Hueco libre de verdad (p.ej. liberado por un rescate
+                # anterior en esta misma pasada): se añade sin desalojar
+                # a nadie.
+                seleccionadas_set.add(idx)
+                ocupantes_por_destino.setdefault(destino, []).append(idx)
+                destino_count[destino] = destino_count.get(destino, 0) + 1
+                origen_count[origen] = origen_count.get(origen, 0) + 1
+                continue
+            ocupantes = ocupantes_por_destino.get(destino, [])
+            elegibles = [
+                o_idx
+                for o_idx in ocupantes
+                if origen_count.get(validas.at[o_idx, "categoria_origen"], 0) - 1
+                >= minimo
+            ]
+            if not elegibles:
+                # Este destino concreto no se puede liberar sin crear otra
+                # víctima por debajo del mínimo: se prueba el siguiente
+                # candidato de este mismo origen necesitado.
+                continue
+            # Desalojar primero a quien más margen tiene (mayor conteo
+            # actual) y, entre esos, el enlace de peor score de ese destino.
+            elegibles.sort(
+                key=lambda o_idx: (
+                    -origen_count[validas.at[o_idx, "categoria_origen"]],
+                    validas.at[o_idx, "score"],
+                )
+            )
+            desalojado_idx = elegibles[0]
+            origen_desalojado = validas.at[desalojado_idx, "categoria_origen"]
+
+            seleccionadas_set.discard(desalojado_idx)
+            ocupantes_por_destino[destino].remove(desalojado_idx)
+            origen_count[origen_desalojado] = origen_count.get(origen_desalojado, 0) - 1
+            donantes_rescate[origen_desalojado] = donantes_rescate.get(origen_desalojado, 0) + 1
+
+            seleccionadas_set.add(idx)
+            ocupantes_por_destino.setdefault(destino, []).append(idx)
+            origen_count[origen] = origen_count.get(origen, 0) + 1
+
+    return list(seleccionadas_set), donantes_rescate
+
+
+def _motivos_num_enlaces(
+    resultado: pd.DataFrame,
+    limites: LimitesPropuesta,
+    ampliacion_origen: dict[str, str],
+    donantes_rescate: dict[str, int] | None = None,
+) -> dict[str, str]:
+    """Explica, por categoría origen, por qué tiene MÁS o MENOS enlaces
+    nuevos de los `max_enlaces_nuevos_por_origen` "normales" — nunca en
+    silencio (decisión de negocio: toda desviación del cupo normal, en
+    cualquiera de los dos sentidos, se explica en la propuesta final, ver
+    `build_formato_ancho`). Si un origen se queda exactamente en el cupo
+    normal, no hace falta ninguna explicación (cadena vacía).
+
+    `donantes_rescate` (ver `_rescatar_minimo_por_congestion`) identifica
+    a los orígenes que han "donado" uno de sus enlaces para rescatar a
+    otro origen muy congestionado; si ESO es lo que explica que un origen
+    se quede por debajo del cupo normal (y no la congestión genérica de
+    siempre), se explica así específicamente, con honestidad.
+    """
+    max_normal = limites.max_enlaces_nuevos_por_origen
+    donantes_rescate = donantes_rescate or {}
+
+    validas = resultado[
+        (~resultado["pendiente_confirmar"]) & (resultado["score"] >= limites.score_minimo)
+    ]
+    n_candidatos = validas.groupby("categoria_origen").size()
+
+    seleccionadas = resultado[resultado["seleccionada"]]
+    n_seleccionados = seleccionadas.groupby("categoria_origen").size()
+
+    # OJO: se recorren TODOS los orígenes de la propuesta (no solo los que
+    # tienen algún enlace seleccionado). Un origen que se queda sin NINGÚN
+    # enlace nuevo (0) sigue estando por debajo del cupo normal y por tanto
+    # también necesita su motivo explicado — antes de este fix quedaba en
+    # blanco porque no aparecía en `n_seleccionados` (al no tener ninguna
+    # fila con `seleccionada=True`, `groupby` nunca genera esa clave).
+    motivos: dict[str, str] = {}
+    for origen in resultado["categoria_origen"].unique():
+        n_sel = int(n_seleccionados.get(origen, 0))
+        if n_sel > max_normal:
+            motivos[origen] = ampliacion_origen.get(
+                origen, "cupo ampliado de forma excepcional"
+            )
+        elif n_sel < max_normal:
+            n_cand = int(n_candidatos.get(origen, 0))
+            if n_cand < max_normal:
+                motivos[origen] = (
+                    f"solo hay {n_cand} categoría(s) destino candidata(s) que cumplen los "
+                    "requisitos mínimos para este origen (tras aplicar grupos aislados, "
+                    "salud técnica y enlaces ya existentes)"
+                )
+            elif origen in donantes_rescate:
+                veces = donantes_rescate[origen]
+                minimo_efectivo = min(_MINIMO_SI_HAY_CANDIDATOS_DE_SOBRA, max_normal)
+                motivos[origen] = (
+                    f"ha cedido {veces} de sus enlaces nuevos a otra(s) categoría(s) que, sin "
+                    "este ajuste, se habrían quedado con muy pocos (se garantiza un mínimo de "
+                    f"{minimo_efectivo} enlaces a cualquier categoría con candidatos de sobra, "
+                    "para que el reparto sea más justo)"
+                )
+            else:
+                motivos[origen] = (
+                    "los destinos candidatos con mejor encaje ya habían agotado su cupo de "
+                    "enlaces entrantes nuevos con otras categorías de origen mejor puntuadas "
+                    "para ese mismo destino"
+                )
+    return motivos
 
 
 def generate_link_proposals(
@@ -721,6 +1141,8 @@ def generate_link_proposals(
     )
     if master.empty:
         return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    ampliacion_origen = _elegibilidad_ampliacion_origen(master)
 
     master["norm_volumen"] = _normalize_min_max(master["volumen"])
     # Decisión de negocio del 30 sept: cuantos MÁS productos tenga la
@@ -862,9 +1284,15 @@ def generate_link_proposals(
         }
     )
 
-    resultado["seleccionada"] = _seleccionar_con_presupuesto_destino(resultado, limites)
+    resultado["seleccionada"], donantes_rescate = _seleccionar_con_presupuesto_destino(
+        resultado, limites, ampliacion_origen
+    )
     if contador is not None:
         contador["pares_seleccionados"] = int(resultado["seleccionada"].sum())
+
+    resultado["motivo_num_enlaces_origen"] = resultado["categoria_origen"].map(
+        _motivos_num_enlaces(resultado, limites, ampliacion_origen, donantes_rescate)
+    ).fillna("")
 
     resultado = resultado.rename(
         columns={
@@ -959,12 +1387,17 @@ def diagnosticar_datasets(
         diagnostico["distribucion_indexable"] = {
             str(k): int(v) for k, v in master["indexable"].value_counts(dropna=False).items()
         }
+    if "profundidad" in master.columns and master["profundidad"].notna().any():
+        diagnostico["profundidad_disponible"] = True
+        diagnostico["profundidad_mediana_catalogo"] = float(master["profundidad"].median())
+    else:
+        diagnostico["profundidad_disponible"] = False
 
-    patrones_grupo = _combinar_con_grupos_obligatorios(grupos_aislados)
-    grupo_aislado = master.apply(
-        lambda r: _detectar_grupo_aislado(r["categoria_principal"], r["categoria_secundaria"], patrones_grupo),
-        axis=1,
-    )
+    # `master` ya trae "grupo_aislado" calculado por `build_master_table`
+    # (con la misma lógica, prioridad de URL incluida) — se reutiliza tal
+    # cual en vez de recalcularlo aquí por segunda vez con una copia
+    # desactualizada de la lógica.
+    grupo_aislado = master["grupo_aislado"]
     diagnostico["distribucion_grupo_aislado"] = {
         (k if k else "(normal, sin grupo)"): int(v)
         for k, v in grupo_aislado.value_counts(dropna=False).items()
@@ -1031,6 +1464,34 @@ def extraer_id_de_url(url: str | None) -> str:
     return match.group(1) if match else ""
 
 
+_PREFIJOS_TITULO_A_QUITAR = ("comprar-",)
+
+
+def _derivar_titulo_desde_url(url: str | None) -> str:
+    """Aproxima un título legible a partir del slug de la URL para las
+    filas sin H1 real (columna opcional, ver `H1_CANDIDATES` en
+    `core.data_loader`): quita el ID numérico del principio y el prefijo
+    "comprar-" si lo hay, y cambia los guiones por espacios.
+
+    OJO: esto NO es el H1 real de la página, es solo una aproximación
+    para poder revisar la propuesta de un vistazo mientras el export del
+    rastreo no incluya esa columna — en cuanto el crawl la traiga, se usa
+    el H1 real y esta función deja de aplicarse a esas filas.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    match = _ID_SLUG_RE.match(slug)
+    if match:
+        slug = slug[match.end():]
+    for prefijo in _PREFIJOS_TITULO_A_QUITAR:
+        if slug.startswith(prefijo):
+            slug = slug[len(prefijo):]
+            break
+    texto = slug.replace("-", " ").replace("_", " ").strip()
+    return texto[:1].upper() + texto[1:] if texto else ""
+
+
 def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
     """Convierte la propuesta (una fila por par origen-destino) al
     formato ancho que ya usaba el equipo con el flujo anterior de
@@ -1042,7 +1503,15 @@ def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
     mayor nº de enlaces seleccionados que tenga cualquier origen (no
     viene fijo a 5): si el límite configurado es distinto, cambia solo.
     """
-    columnas_vacias = ["id", "url", "categoria_principal", "categoria_secundaria", "n_enlaces"]
+    columnas_vacias = [
+        "id",
+        "url",
+        "h1",
+        "categoria_principal",
+        "categoria_secundaria",
+        "n_enlaces",
+        "motivo_num_enlaces",
+    ]
     if resultado is None or resultado.empty or "seleccionada" not in resultado.columns:
         return pd.DataFrame(columns=columnas_vacias)
 
@@ -1065,16 +1534,19 @@ def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
     for origen, grupo in seleccion.groupby("categoria_origen", sort=False):
         primera = grupo.iloc[0]
         fila = {
-            "id": extraer_id_de_url(origen),
+            "id": primera.get("id_origen", "") or extraer_id_de_url(origen),
             "url": origen,
+            "h1": primera.get("h1_origen", ""),
             "categoria_principal": primera.get("categoria_principal_origen", ""),
             "categoria_secundaria": primera.get("categoria_secundaria_origen", ""),
             "n_enlaces": int(len(grupo)),
+            "motivo_num_enlaces": primera.get("motivo_num_enlaces_origen", "") or "",
         }
         for row in grupo.itertuples(index=False):
             n = int(row.orden)
-            fila[f"linked_id_{n}"] = extraer_id_de_url(row.categoria_destino)
+            fila[f"linked_id_{n}"] = getattr(row, "id_destino", "") or extraer_id_de_url(row.categoria_destino)
             fila[f"linked_url_{n}"] = row.categoria_destino
+            fila[f"linked_h1_{n}"] = getattr(row, "h1_destino", "")
             fila[f"linked_category_{n}"] = getattr(row, "categoria_principal_destino", "")
             fila[f"linked_subcategory_{n}"] = getattr(row, "categoria_secundaria_destino", "")
             score_n = getattr(row, "score", float("nan"))
@@ -1087,6 +1559,7 @@ def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
         columnas += [
             f"linked_id_{n}",
             f"linked_url_{n}",
+            f"linked_h1_{n}",
             f"linked_category_{n}",
             f"linked_subcategory_{n}",
             f"linked_score_{n}",
@@ -1094,6 +1567,85 @@ def build_formato_ancho(resultado: pd.DataFrame) -> pd.DataFrame:
         ]
 
     return pd.DataFrame(filas).reindex(columns=columnas)
+
+
+# ---------------------------------------------------------------------------
+# 5.1) Formato "para IT" (SQL listo para ejecutar, mismo formato que el
+# documento que el equipo ya pasaba a IT en marzo 2025)
+# ---------------------------------------------------------------------------
+
+# Lista de `id_shop` (multi-tienda de PrestaShop: distintos idiomas/países
+# de Sklum) que llevaba el documento de marzo 2025. Es un dato de NEGOCIO
+# (qué tiendas existen hoy), no una constante técnica, así que se deja
+# como valor por defecto configurable en vez de fijarlo sin más -- si el
+# equipo añade o retira alguna tienda, basta con pasar `shops` distinto.
+IT_SHOPS_DEFAULT = "11,15,16,17,19,20,23,26,382,383"
+
+FORMATO_IT_COLUMNS = [
+    "ID CAT MAIN",
+    "URL",
+    "Identificadores de las categorías, lista 2",
+    "UPDATE",
+]
+
+
+def build_formato_it(resultado: pd.DataFrame, shops: str = IT_SHOPS_DEFAULT) -> pd.DataFrame:
+    """Convierte la propuesta al formato exacto que el equipo ya pasaba a
+    IT en marzo 2025 (hoja "Info a IT"): una fila por URL origen con su
+    ID de categoría, la lista de IDs destino separados por coma (mismo
+    orden de score que `build_formato_ancho`) y la sentencia SQL ya lista
+    para ejecutar sobre `led_category_shop`.
+
+    Diferencia deliberada con el documento de marzo 2025: aquella lista
+    tenía SIEMPRE exactamente 5 IDs por fila; aquí tiene tantos IDs como
+    enlaces se hayan seleccionado de verdad para esa categoría (de 3 a
+    `max_enlaces_nuevos_por_origen_excepcional`) -- refleja la propuesta
+    real en vez de recortarla por compatibilidad con el formato antiguo.
+    Si el campo `id_list_two` de PrestaShop/la plantilla del front
+    necesitara un nº fijo de huecos, hay que confirmarlo con IT antes de
+    ejecutar el SQL.
+
+    No incluye enlaces manuales a páginas CMS (tipo "cms:1069" en el
+    documento de marzo 2025): esta herramienta solo conoce categorías de
+    producto del rastreo, no páginas de contenido.
+
+    `shops` es la lista de `id_shop` separados por coma que va en el
+    WHERE de cada UPDATE -- por defecto, la misma que ya usaba el equipo
+    en marzo 2025 (`IT_SHOPS_DEFAULT`).
+    """
+    if resultado is None or resultado.empty or "seleccionada" not in resultado.columns:
+        return pd.DataFrame(columns=FORMATO_IT_COLUMNS)
+
+    ancho = build_formato_ancho(resultado)
+    if ancho.empty:
+        return pd.DataFrame(columns=FORMATO_IT_COLUMNS)
+
+    id_cols = sorted(
+        (c for c in ancho.columns if c.startswith("linked_id_")),
+        key=lambda c: int(c.rsplit("_", 1)[-1]),
+    )
+
+    filas = []
+    for _, row in ancho.iterrows():
+        ids = [str(row[c]) for c in id_cols if _valor_valido(row[c]) and str(row[c]).strip() != ""]
+        id_main = str(row.get("id", "") or "").strip()
+        if not ids or not id_main:
+            continue
+        lista2 = ",".join(ids)
+        url = str(row.get("url", "") or "")
+        filas.append(
+            {
+                "ID CAT MAIN": int(id_main) if id_main.isdigit() else id_main,
+                "URL": f"https://www.{url}" if url else "",
+                "Identificadores de las categorías, lista 2": lista2,
+                "UPDATE": (
+                    f"UPDATE led_category_shop SET `id_list_two`='{lista2}' WHERE  "
+                    f"`id_category`={id_main} AND `id_shop`in ({shops});"
+                ),
+            }
+        )
+
+    return pd.DataFrame(filas, columns=FORMATO_IT_COLUMNS)
 
 
 def _valor_valido(valor) -> bool:
