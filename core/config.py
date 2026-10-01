@@ -147,6 +147,19 @@ class LimitesPropuesta:
     # que el script anterior evitaba con su cuota "En. Obj." por destino.
     max_enlaces_nuevos_por_destino: int = 8
 
+    # Ampliación EXCEPCIONAL del cupo por origen (decisión de negocio del
+    # 30 sept, ver `core.scoring._elegibilidad_ampliacion_origen`): NO es
+    # un nuevo límite general -la inmensa mayoría de categorías se queda
+    # en `max_enlaces_nuevos_por_origen` de siempre-, es un techo más
+    # alto que solo se usa para las pocas categorías que cumplen una
+    # condición claramente excepcional (casi sin enlaces salientes
+    # propios todavía, o mucha autoridad interna). Cada vez que una
+    # categoría recibe más de los enlaces "normales" (o menos, porque no
+    # había suficientes destinos válidos), la propuesta final explica el
+    # motivo en la columna `motivo_num_enlaces` de
+    # `core.scoring.build_formato_ancho` — nunca en silencio.
+    max_enlaces_nuevos_por_origen_excepcional: int = 10
+
 
 @dataclass
 class AppConfig:
